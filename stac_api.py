@@ -293,14 +293,20 @@ def perform_search(req: SearchRequest) -> List[Dict[str, Any]]:
     if not catalog_url:
         raise HTTPException(status_code=400, detail=f"Invalid catalog key. Choices: {list(STAC_CATALOGS.keys())} or 'nasa'")
         
-    dt_str = f"{req.start_date}/{req.end_date}"
     client = Client.open(catalog_url)
+    # 3. Perform Search
+    # Special optimization: DEM data (like cop-dem-glo-30) often doesn't have a record date 
+    # matching the imagery window. We skip datetime for DEMs.
+    is_dem = any(token in req.collections[0].lower() for token in ["dem", "nasadem", "alpsml"])
+    current_dt = None if is_dem else f"{req.start_date}/{req.end_date}"
+    
     search = client.search(
         collections=req.collections,
         intersects=aoi_geom,
-        datetime=dt_str,
+        datetime=current_dt,
         max_items=req.max_items
     )
+
     return [item.to_dict() for item in search.items()]
 
 @app.post("/stac/discover", response_model=List[CollectionInfo])
