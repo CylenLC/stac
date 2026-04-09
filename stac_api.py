@@ -180,15 +180,25 @@ def download_worker(task_id: str, catalog: str, items: List[dict], only_main: bo
             if only_main and not is_main:
                 continue
             
+            # --- 加固：从原始 href 提取文件名 ---
+            original_href = a_info.get("href", "")
+            filename = original_href.split("/")[-1].split("?")[0]
+            if not filename or len(filename) > 120:
+                filename = f"{a_key}.data"
+            
             url = resolve_asset_url(a_info, catalog)
             size = get_asset_size(url)
             total_bytes += size
+            
             download_queue.append({
                 "url": url,
                 "item_dir": os.path.join(DOWNLOAD_DIR, cid, iid),
-                "filename": url.split("/")[-1].split("?")[0] or f"{a_key}.data",
+                "filename": filename,
                 "metadata": item
             })
+
+
+
             
     TASKS[task_id]["total_bytes"] = total_bytes
     TASKS[task_id]["status"] = "downloading"

@@ -96,9 +96,15 @@ def download(catalog_key: str, items: List[dict], output_dir: str, only_main: bo
             if only_main and not is_main:
                 continue
             
+            # --- 加固：从原始地址提取文件名 ---
+            original_href = a_info.get("href", "")
+            filename = original_href.split("/")[-1].split("?")[0]
+            if not filename or len(filename) > 120:
+                filename = f"{a_key}.data"
+                
             url = resolve_asset_url(a_info, catalog_key)
-            filename = url.split("/")[-1].split("?")[0] or f"{a_key}.data"
             save_path = os.path.join(item_dir, filename)
+
             
             if os.path.exists(save_path):
                 print(f"  [Skip] {filename} exists.")
