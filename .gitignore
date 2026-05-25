@@ -11,3 +11,5 @@ wheels/
 .downloads/
 .ipynb_checkpoints/
 .watershed_images/
+
+downloads
