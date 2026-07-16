@@ -55,8 +55,8 @@ Search arguments:
 | `--catalog` | `microsoft`, `earth-search`, or `nasa`; defaults to `microsoft`. |
 | `--wkt` | Required WKT geometry for the area of interest. |
 | `--collections` | Required comma-separated collection IDs or NASA short names. |
-| `--start` | Start date in `YYYY-MM-DD`; defaults to `2023-12-01`. |
-| `--end` | End date in `YYYY-MM-DD`; defaults to `2023-12-31`. |
+| `--start` | Required start date in `YYYY-MM-DD`. |
+| `--end` | Required end date in `YYYY-MM-DD`. |
 | `--max` | Maximum item count; defaults to `50`. |
 | `--output` | Optional JSON path for results; use it when downloading afterward. |
 
@@ -92,13 +92,15 @@ Download arguments:
 
 ## NASA CMR Downloads
 
-NASA searches use the collection short name, for example:
+NASA searches use the CMR collection short name. For HLS v2.0, this skill also
+accepts the product-style aliases `HLSL30_V2.0` and `HLSS30_V2.0`, and maps
+them to the CMR short names `HLSL30` and `HLSS30` with version `2.0`.
 
 ```bash
 uv run python .agents/skills/stac_downloader/scripts/stac_tool.py search \
   --catalog nasa \
   --wkt "POLYGON ((124.4 42.1, 124.5 42.1, 124.5 42.2, 124.4 42.2, 124.4 42.1))" \
-  --collections "SWOT_L2_HR_RiverSP_2.0" \
+  --collections "HLSL30_V2.0,HLSS30_V2.0" \
   --start "2023-12-01" \
   --end "2023-12-05" \
   --max 5 \

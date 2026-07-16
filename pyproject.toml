@@ -1,7 +1,7 @@
 [project]
 name = "stac"
 version = "0.1.0"
-description = "Add your description here"
+description = "CLI and FastAPI service for searching and downloading STAC and NASA CMR data"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [

@@ -97,19 +97,21 @@ uv run python .agents/skills/stac_downloader/scripts/stac_tool.py download \
   --outdir downloads
 ```
 
-默认只下载主要资产。如果需要下载结果中的所有资产，请在指令中明确写出“下载所有资产”；对应下载命令会增加 `--all` 参数。
+默认下载预览或代表性波段（例如 `B04`、`B08`、`Fmask`）。如果需要下载结果中的所有资产，请在指令中明确写出“下载所有资产”；对应下载命令会增加 `--all` 参数。下载使用临时 `.part` 文件，只有完整传输后才会写入最终文件名。
 
-NASA CMR 下载同样可以交给 Agent 执行，将数据源设置为 `nasa`，并使用对应的 collection short name（例如 `SWOT_L2_HR_RiverSP_2.0`）。下载 NASA 受保护文件前，需先配置上述 Earthdata 凭据。
+NASA CMR 下载同样可以交给 Agent 执行，将数据源设置为 `nasa`。HLS v2.0 可以直接使用产品名称 `HLSL30_V2.0` 和 `HLSS30_V2.0`，工具会自动映射到 NASA CMR 的 `HLSL30` / `HLSS30` collection，并指定版本 `2.0`。下载 NASA 受保护文件前，需先配置上述 Earthdata 凭据。
 
-Skill 是直接执行的 CLI 工作流，不提供后台任务进度查询。需要任务 ID、后台下载和进度监控时，请使用 FastAPI 服务的 `/stac/search_and_download` 接口。
+Skill 是直接执行的 CLI 工作流，不提供后台任务进度查询。需要任务 ID、后台下载和进度监控时，请使用 FastAPI 服务的 `/stac/search_and_download` 接口。任务状态可能为 `completed`、`partial` 或 `failed`；`partial` 表示至少一个文件下载失败，详情可从任务状态中的 `failures` 字段取得。
 
 ## 📂 项目结构
 
 - `stac_api.py`: FastAPI 服务核心，管理后台下载流与状态。
+- `stac_core.py`: API 与 CLI 共用的 catalog 查询、asset 解析和安全下载逻辑。
 - `monitor_task.py`: CLI 进度监控工具。
 - `.agents/skills/stac_downloader/SKILL.md`: Agent Skill 使用说明。
 - `.agents/skills/stac_downloader/scripts/stac_tool.py`: 供 AI Agent 或直接 CLI 调用的统一检索下载工具。
 - `downloads/`: 下载数据存放目录，按 `Collection/ItemID` 自动分类。
+- `tests/`: 不依赖网络的核心功能测试。
 
 ## 🧪 高级接口
 

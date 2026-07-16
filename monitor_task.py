@@ -20,7 +20,7 @@ def monitor_task(task_id, base_url="http://localhost:8000"):
     
     try:
         while True:
-            response = requests.get(url)
+            response = requests.get(url, timeout=(10, 30))
             if response.status_code != 200:
                 print(f"❌ 错误: 无法获取任务状态 ({response.status_code})")
                 break
@@ -52,13 +52,16 @@ def monitor_task(task_id, base_url="http://localhost:8000"):
             
             pbar.set_postfix_str(f"{status} | {size_info} | 速: {format_size(speed)}/s | 剩: {eta_str}")
             
-            if status == "completed":
+            if status in {"completed", "partial"}:
                 pbar.n = 100
                 pbar.refresh()
                 pbar.close()
-                print(f"\n✅ 任务完成！总大小: {format_size(downloaded)} | 耗时: {elapsed}s")
+                label = "✅ 任务完成" if status == "completed" else "⚠️ 任务部分完成"
+                print(f"\n{label}！总大小: {format_size(downloaded)} | 耗时: {elapsed}s")
                 if data.get("results"):
                     print(f"📂 文件路径:\n" + "\n".join([f"  - {r}" for r in data["results"][:5]]))
+                if data.get("failures"):
+                    print("❌ 失败项:\n" + "\n".join([f"  - {failure}" for failure in data["failures"][:5]]))
                 break
             
             if status == "failed":

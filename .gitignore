@@ -13,3 +13,4 @@ wheels/
 .watershed_images/
 
 downloads
+.DS_Store
