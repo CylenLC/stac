@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Earth Lake 数据监控与采集控制台" />
+    <title>Earth Lake Console</title>
+    <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.6.2/dist/maplibre-gl.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260717-2" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <a class="brand" href="#overview" aria-label="Earth Lake 首页">
+          <span class="brand-mark" aria-hidden="true">
+            <span></span><span></span><span></span>
+          </span>
+          <span><strong>Earth Lake</strong><small>Protocol Console</small></span>
+        </a>
+
+        <nav class="nav" aria-label="主导航">
+          <button class="nav-item active" data-route="overview">
+            <span class="nav-icon">01</span><span>概览</span>
+          </button>
+          <button class="nav-item" data-route="catalog">
+            <span class="nav-icon">02</span><span>数据目录</span>
+          </button>
+          <button class="nav-item" data-route="explore">
+            <span class="nav-icon">03</span><span>空间浏览</span>
+          </button>
+          <button class="nav-item" data-route="entities">
+            <span class="nav-icon">04</span><span>实体与数组</span>
+          </button>
+          <button class="nav-item" data-route="downloads">
+            <span class="nav-icon">05</span><span>下载任务</span>
+          </button>
+          <button class="nav-item" data-route="system">
+            <span class="nav-icon">06</span><span>协议与系统</span>
+          </button>
+        </nav>
+
+        <div class="sidebar-foot">
+          <div class="api-state"><span class="pulse" id="apiPulse"></span><span id="apiState">正在连接 API</span></div>
+          <p>Earth Zarr Protocol <span id="protocolVersion">0.1</span></p>
+        </div>
+      </aside>
+
+      <div class="workspace">
+        <header class="topbar">
+          <label class="global-search">
+            <span aria-hidden="true">⌕</span>
+            <input id="globalSearch" type="search" placeholder="搜索产品、资产、变量或运行 ID" autocomplete="off" />
+            <kbd>/</kbd>
+          </label>
+          <div class="top-actions">
+            <button class="quiet-button" id="refreshButton">刷新</button>
+            <button class="primary-button" data-route-target="downloads">新建下载</button>
+          </div>
+        </header>
+
+        <main id="mainContent" tabindex="-1">
+          <div class="page-loading">
+            <span class="loader"></span>
+            <p>正在读取 Earth Lake 元数据</p>
+          </div>
+        </main>
+      </div>
+    </div>
+
+    <section class="transfer-dock hidden" id="transferDock" aria-live="polite">
+      <button class="dock-summary" id="dockToggle">
+        <span class="loader small"></span>
+        <span><strong id="dockTitle">下载任务运行中</strong><small id="dockMessage"></small></span>
+        <span class="dock-percent" id="dockPercent">0%</span>
+      </button>
+      <div class="progress-track"><span id="dockProgress"></span></div>
+    </section>
+
+    <div class="drawer-backdrop hidden" id="drawerBackdrop"></div>
+    <aside class="detail-drawer hidden" id="detailDrawer" aria-label="详情">
+      <header>
+        <div><p class="eyebrow" id="drawerEyebrow">资产详情</p><h2 id="drawerTitle"></h2></div>
+        <button class="icon-button" id="drawerClose" aria-label="关闭">×</button>
+      </header>
+      <div id="drawerBody" class="drawer-body"></div>
+    </aside>
+
+    <div class="toast-region" id="toastRegion" aria-live="polite"></div>
+    <script src="https://unpkg.com/maplibre-gl@5.6.2/dist/maplibre-gl.js" defer></script>
+    <script src="/static/app.js?v=20260717-2" defer></script>
+  </body>
+</html>

@@ -7,7 +7,8 @@ from Microsoft Planetary Computer, AWS Earth Search, or NASA CMR.
 
 - Search for items using a WKT area of interest, one or more collections, and
   an optional date range.
-- Download search results into `downloads/<collection>/<item_id>/`.
+- Download search results into an Earth Zarr Protocol lake under `downloads/`.
+- Maintain STAC, Parquet registries, checksums, and processing lineage automatically.
 - Sign Microsoft Planetary Computer asset URLs automatically.
 - Download NASA CMR data when local Earthdata authentication is configured.
 
@@ -30,7 +31,7 @@ describing commands:
    range, result limit, and whether to download main assets only or all assets.
 2. Run `search` and save the results to a JSON file.
 3. Run `download` using the saved JSON file.
-4. Report the downloaded paths and any failures shown during execution.
+4. Report the downloaded paths, protocol root, processing run ID, and failures.
 
 Ask for missing information only when it cannot be reasonably inferred. A
 download request needs at least a collection and a geographic area.
@@ -122,7 +123,22 @@ Downloaded files are stored under:
 
 ```text
 downloads/
-  <collection>/
-    <item_id>/
-      <asset files>
+  protocol/
+  catalog/stac/
+  registry/
+  source/
+    <catalog>/
+      <collection>/
+        <item_id>/
+          <asset files>
+  arrays/
+  entities/
+  virtual/
+  manifests/
+  cache/
 ```
+
+The download command initializes the protocol tree when needed. Every successful
+or skipped source asset is registered in `registry/assets.parquet`, linked to a
+row in `registry/processing_runs.parquet`, and exposed as a STAC Asset. Source
+files are registered only; downloading does not materialize Zarr arrays.

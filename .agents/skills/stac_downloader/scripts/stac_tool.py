@@ -7,12 +7,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[4]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from earth_lake import EarthLake
 from stac_core import (
     asset_filename,
     download_asset,
+    get_collection_metadata,
     get_asset_size,
     http_session,
-    item_directory,
     resolve_asset_url,
     search_items,
     selected_assets,
@@ -27,10 +28,21 @@ def search(catalog: str, wkt: str, collections: list[str], start: str, end: str,
 
 
 def download(catalog: str, items: list[dict], output_dir: str, only_main: bool) -> int:
+    lake = EarthLake(output_dir)
+    run_id = lake.start_run(
+        {"interface": "cli", "catalog": catalog, "only_main": only_main, "item_count": len(items)}
+    )
     session = http_session()
     failures: list[str] = []
+    output_asset_ids: list[str] = []
     downloaded = 0
     skipped = 0
+    collection_metadata_by_id: dict[str, dict] = {}
+    for collection in {str(item.get("collection")) for item in items if item.get("collection")}:
+        try:
+            collection_metadata_by_id[collection] = get_collection_metadata(catalog, collection)
+        except Exception as exc:
+            print(f"  [Warning] Could not fetch metadata for {collection}: {exc}", file=sys.stderr)
 
     for item in items:
         assets = list(selected_assets(item, only_main))
@@ -39,8 +51,11 @@ def download(catalog: str, items: list[dict], output_dir: str, only_main: bool) 
             continue
         for key, asset in assets:
             try:
-                directory = item_directory(output_dir, item.get("collection"), item.get("id"))
+                directory = lake.source_item_directory(catalog, item.get("collection"), item.get("id"))
                 directory.mkdir(parents=True, exist_ok=True)
+                metadata_path = directory / "metadata.json"
+                if not metadata_path.exists():
+                    metadata_path.write_text(json.dumps(item, indent=2), encoding="utf-8")
                 destination = directory / asset_filename(key, asset)
                 url = resolve_asset_url(asset, catalog)
                 expected_size = get_asset_size(session, url)
@@ -50,15 +65,43 @@ def download(catalog: str, items: list[dict], output_dir: str, only_main: bool) 
                         raise ValueError(f"existing file size {actual_size} does not match expected {expected_size}")
                     skipped += 1
                     print(f"  [Skip] {destination.name} exists.")
+                    output_asset_ids.append(
+                        lake.record_asset(
+                            run_id=run_id,
+                            catalog=catalog,
+                            item=item,
+                            asset_key=key,
+                            source_url=asset.get("href", ""),
+                            local_path=destination,
+                            status="skipped",
+                            collection_metadata=collection_metadata_by_id.get(item.get("collection")),
+                        )
+                    )
                     continue
                 print(f"  [Downloading] {destination.name} ...")
                 download_asset(session, url, destination)
+                output_asset_ids.append(
+                    lake.record_asset(
+                        run_id=run_id,
+                        catalog=catalog,
+                        item=item,
+                        asset_key=key,
+                        source_url=asset.get("href", ""),
+                        local_path=destination,
+                        status="downloaded",
+                        collection_metadata=collection_metadata_by_id.get(item.get("collection")),
+                    )
+                )
                 downloaded += 1
             except Exception as exc:
                 failures.append(f"{item.get('id', 'unknown')}/{key}: {exc}")
                 print(f"  [Error] {failures[-1]}", file=sys.stderr)
 
+    completed = downloaded + skipped
+    status = "partial" if failures and completed else "failed" if failures else "completed"
+    lake.finish_run(run_id, status, output_asset_ids)
     print(f"Downloaded: {downloaded}, skipped: {skipped}, failed: {len(failures)}")
+    print(f"Protocol root: {lake.root} (run_id={run_id})")
     return 1 if failures else 0
 
 

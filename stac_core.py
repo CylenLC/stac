@@ -17,6 +17,7 @@ STAC_CATALOGS = {
     "earth-search": "https://earth-search.aws.element84.com/v1",
 }
 NASA_CMR_URL = "https://cmr.earthdata.nasa.gov/search/granules.json"
+NASA_CMR_COLLECTIONS_URL = "https://cmr.earthdata.nasa.gov/search/collections.json"
 NASA_COLLECTIONS = {
     "HLSL30_V2.0": ("HLSL30", "2.0"),
     "HLSS30_V2.0": ("HLSS30", "2.0"),
@@ -94,6 +95,35 @@ def nasa_assets(links: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return assets
 
 
+def cmr_geometry(entry: dict[str, Any]) -> tuple[dict[str, Any] | None, list[float] | None]:
+    rings: list[list[list[float]]] = []
+    for polygon_group in entry.get("polygons", []):
+        for polygon in polygon_group:
+            values = [float(value) for value in polygon.split()]
+            coordinates = [[values[index + 1], values[index]] for index in range(0, len(values), 2)]
+            if coordinates and coordinates[0] != coordinates[-1]:
+                coordinates.append(coordinates[0])
+            if len(coordinates) >= 4:
+                rings.append(coordinates)
+
+    if not rings and entry.get("boxes"):
+        south, west, north, east = map(float, entry["boxes"][0].split())
+        rings = [[[west, south], [east, south], [east, north], [west, north], [west, south]]]
+    if not rings:
+        return None, None
+
+    points = [point for ring in rings for point in ring]
+    bbox = [
+        min(point[0] for point in points),
+        min(point[1] for point in points),
+        max(point[0] for point in points),
+        max(point[1] for point in points),
+    ]
+    if len(rings) == 1:
+        return {"type": "Polygon", "coordinates": [rings[0]]}, bbox
+    return {"type": "MultiPolygon", "coordinates": [[[point for point in ring]] for ring in rings]}, bbox
+
+
 def search_items(
     catalog: str,
     wkt: str,
@@ -122,11 +152,18 @@ def search_items(
             response = session.get(NASA_CMR_URL, params=params, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
             for entry in response.json().get("feed", {}).get("entry", []):
+                geometry, item_bbox = cmr_geometry(entry)
                 items.append(
                     {
                         "id": entry.get("id"),
                         "collection": collection,
-                        "properties": {"datetime": entry.get("time_start")},
+                        "bbox": item_bbox,
+                        "geometry": geometry,
+                        "properties": {
+                            "datetime": entry.get("time_start"),
+                            "cloud_cover": entry.get("cloud_cover"),
+                            "producer_granule_id": entry.get("producer_granule_id"),
+                        },
                         "assets": nasa_assets(entry.get("links", [])),
                     }
                 )
@@ -149,6 +186,24 @@ def search_items(
     return [item.to_dict() for item in search.items()]
 
 
+def get_collection_metadata(catalog: str, collection: str) -> dict[str, Any]:
+    """Fetch one authoritative STAC Collection or CMR collection record."""
+    if catalog == "nasa":
+        short_name, version = NASA_COLLECTIONS.get(collection, (collection, None))
+        params: dict[str, Any] = {"short_name": short_name, "page_size": 1}
+        if version:
+            params["version"] = version
+        response = http_session().get(NASA_CMR_COLLECTIONS_URL, params=params, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        entries = response.json().get("feed", {}).get("entry", [])
+        return entries[0] if entries else {}
+
+    catalog_url = STAC_CATALOGS.get(catalog)
+    if not catalog_url:
+        raise ValueError(f"Invalid catalog: {catalog}")
+    return Client.open(catalog_url).get_collection(collection).to_dict()
+
+
 def is_main_asset(asset_key: str, asset: dict[str, Any], asset_count: int) -> bool:
     if asset_count == 1:
         return True
@@ -166,8 +221,13 @@ def is_main_asset(asset_key: str, asset: dict[str, Any], asset_count: int) -> bo
 
 def selected_assets(item: dict[str, Any], only_main: bool) -> Iterable[tuple[str, dict[str, Any]]]:
     assets = item.get("assets", {})
+    collection = item.get("collection", "")
+    preferred = {
+        "HLSL30_V2.0": {"B04", "B05", "Fmask"},
+        "HLSS30_V2.0": {"B04", "B8A", "Fmask"},
+    }.get(collection)
     for key, asset in assets.items():
-        if not only_main or is_main_asset(key, asset, len(assets)):
+        if not only_main or (key in preferred if preferred else is_main_asset(key, asset, len(assets))):
             yield key, asset
 
 
