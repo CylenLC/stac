@@ -12,9 +12,12 @@ const state = {
   protocol: {},
   selectedAssetId: null,
   spatialFeatures: [],
+  exactSpatialAssetIds: new Set(),
+  exactSpatialRequest: 0,
   exploreMap: null,
   registryTable: "sources",
   pollTick: 0,
+  runCursor: null,
 };
 
 const main = document.querySelector("#mainContent");
@@ -51,6 +54,16 @@ const formatDuration = (seconds) => {
 const shortId = (value, length = 12) => value && value.length > length ? `${value.slice(0, length)}…` : value || "—";
 const badge = (status) => `<span class="badge ${escapeHtml(status || "reserved")}">${escapeHtml(status || "reserved")}</span>`;
 
+function idempotencyKey() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  if (globalThis.crypto?.getRandomValues) {
+    const bytes = new Uint32Array(4);
+    globalThis.crypto.getRandomValues(bytes);
+    return `acq-${Date.now()}-${[...bytes].map((value) => value.toString(16)).join("")}`;
+  }
+  return `acq-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, {headers: {"Content-Type": "application/json"}, ...options});
   if (!response.ok) {
@@ -70,11 +83,11 @@ function toast(message, type = "info") {
 }
 
 async function loadBaseData() {
-  const [summary, products, assets, runs, tasks, arrays] = await Promise.all([
+  const [summary, products, assets, runs, tasks] = await Promise.all([
     api("/lake/summary"), api("/lake/products"), api("/lake/assets?limit=500"),
-    api("/lake/runs?limit=200"), api("/stac/tasks"), api("/lake/arrays"),
+    api("/acquisitions?limit=50"), api("/stac/tasks"),
   ]);
-  Object.assign(state, {summary, products, assets: assets.items, runs: runs.items, tasks, arrays});
+  Object.assign(state, {summary, products, assets: assets.items, runs: runs.items, runCursor: runs.next_cursor, tasks});
   document.querySelector("#apiPulse").className = "pulse ok";
   document.querySelector("#apiState").textContent = "API 已连接";
   document.querySelector("#protocolVersion").textContent = summary.protocol?.version || "0.1";
@@ -180,6 +193,8 @@ function assetsTable(assets) {
 async function renderExplore() {
   const spatial = await api("/lake/spatial/assets");
   state.spatialFeatures = spatial.features || [];
+  state.exactSpatialAssetIds.clear();
+  state.exactSpatialRequest += 1;
   const available = state.spatialFeatures;
   if (!available.some((feature) => feature.properties.asset_id === state.selectedAssetId)) state.selectedAssetId = preferredSpatialFeature(available)?.properties.asset_id || null;
   const options = (name) => [...new Set(available.map((feature) => feature.properties[name]).filter(Boolean))].sort();
@@ -194,7 +209,7 @@ async function renderExplore() {
     </section>
     <section class="world-map-layout">
       <aside class="map-sidebar"><header><h3>Assets</h3><p class="muted" id="spatialCount">${available.length} 个空间资产</p></header><div id="spatialAssetList" class="asset-list"></div></aside>
-      <div class="world-map-stage"><div id="worldMap" aria-label="全球资产地图"></div><div class="map-note"><strong>空间浏览</strong><br><span class="muted">已下载 GeoTIFF 优先显示有效像元范围；无有效掩膜时回退栅格网格、STAC geometry 或 bbox。预览仅渲染当前选中资产，并复用服务器缓存。</span></div><div class="map-legend"><span><i class="footprint-key"></i>有效数据范围</span><span><i class="preview-key"></i>GeoTIFF 预览</span></div></div>
+      <div class="world-map-stage"><div id="worldMap" aria-label="全球资产地图"></div><div class="map-note"><strong>空间浏览</strong><br><span class="muted">首屏范围来自注册表中的栅格网格；选中资产后异步替换为有效像元精确边界。预览仅渲染当前选中资产，并复用服务器缓存。</span></div><div class="map-legend"><span><i class="footprint-key"></i>资产范围</span><span><i class="preview-key"></i>GeoTIFF 预览</span></div></div>
       <aside class="map-controls"><h3>图层</h3><label class="checkbox"><input id="footprintToggle" type="checkbox" checked> 资产范围</label><label class="checkbox"><input id="previewToggleSide" type="checkbox" checked> 栅格预览</label><hr><h3>选择</h3><div id="spatialSelection" class="muted">选择资产以查看元数据和预览。</div></aside>
     </section>`;
   bindExploreFilters();
@@ -215,9 +230,32 @@ function filteredSpatialFeatures() {
 }
 
 function preferredSpatialFeature(features) {
-  return features.find((feature) => feature.properties.variable === "B04")
-    || features.find((feature) => feature.properties.variable !== "Fmask")
-    || features[0];
+  const ranked = [...features].sort((left, right) => featureCoverageRatio(right) - featureCoverageRatio(left));
+  return ranked.find((feature) => feature.properties.variable === "B04")
+    || ranked.find((feature) => feature.properties.variable !== "Fmask")
+    || ranked[0];
+}
+
+function featureCoverageRatio(feature) {
+  const footprint = geometryBounds(feature?.geometry);
+  const corners = feature?.properties?.preview_coordinates;
+  if (!footprint || !Array.isArray(corners) || corners.length !== 4) return 0;
+  const raster = geometryBounds({type: "Polygon", coordinates: [corners]});
+  if (!raster) return 0;
+  const area = (bounds) => Math.max(0, bounds[1][0] - bounds[0][0]) * Math.max(0, bounds[1][1] - bounds[0][1]);
+  const rasterArea = area(raster);
+  return rasterArea > 0 ? Math.min(1, area(footprint) / rasterArea) : 0;
+}
+
+function mapFootprintFeatures(features) {
+  const byGranule = new Map();
+  features.forEach((feature) => {
+    const props = feature.properties || {};
+    const key = `${props.product_id || "unknown"}\u0000${props.source_item_id || props.asset_id}`;
+    const current = byGranule.get(key);
+    if (!current || featureCoverageRatio(feature) > featureCoverageRatio(current)) byGranule.set(key, feature);
+  });
+  return [...byGranule.values()];
 }
 
 function renderSpatialAssetList(features) {
@@ -243,7 +281,7 @@ function bindExploreFilters() {
   document.querySelector("#previewToggle").addEventListener("change", (event) => togglePreview(event.target.checked));
   document.querySelector("#previewToggleSide").addEventListener("change", (event) => togglePreview(event.target.checked));
   document.querySelector("#footprintToggle").addEventListener("change", (event) => {
-    const map = state.exploreMap; if (!map?.isStyleLoaded()) return;
+    const map = state.exploreMap; if (!map?.getLayer("asset-footprints-fill")) return;
     ["asset-footprints-fill", "asset-footprints-outline", "selected-asset-outline"].forEach((id) => map.setLayoutProperty(id, "visibility", event.target.checked ? "visible" : "none"));
   });
   document.querySelector("#fitAssets").addEventListener("click", () => fitExploreMap(filteredSpatialFeatures()));
@@ -275,6 +313,7 @@ function initializeExploreMap(features) {
     map.on("mouseenter", "asset-footprints-fill", () => { map.getCanvas().style.cursor = "pointer"; });
     map.on("mouseleave", "asset-footprints-fill", () => { map.getCanvas().style.cursor = ""; });
     updateExploreMap(features, true);
+    void hydrateSelectedSpatialFeature();
   });
 }
 
@@ -291,7 +330,7 @@ function geometryBounds(geometry) {
 
 function fitExploreMap(features) {
   const map = state.exploreMap;
-  const points = features.flatMap((feature) => geometryBounds(feature.geometry) || []);
+  const points = mapFootprintFeatures(features).flatMap((feature) => geometryBounds(feature.geometry) || []);
   if (!map || !points.length) return;
   const bounds = points.reduce((result, point) => [[Math.min(result[0][0], point[0]), Math.min(result[0][1], point[1])], [Math.max(result[1][0], point[0]), Math.max(result[1][1], point[1])]], [[Infinity, Infinity], [-Infinity, -Infinity]]);
   map.fitBounds(bounds, {padding: 74, maxZoom: 9, duration: 500});
@@ -300,11 +339,13 @@ function fitExploreMap(features) {
 function updateExploreMap(features, fit = false) {
   const map = state.exploreMap;
   if (!map) return;
-  if (!map.isStyleLoaded()) {
-    map.once("idle", () => updateExploreMap(features, fit));
+  if (!map.getSource("assets")) {
+    map.once("load", () => updateExploreMap(features, fit));
     return;
   }
-  map.getSource("assets")?.setData({type: "FeatureCollection", features});
+  const footprints = mapFootprintFeatures(features);
+  map.getSource("assets")?.setData({type: "FeatureCollection", features: footprints});
+  document.querySelector("#worldMap")?.setAttribute("data-footprint-count", String(footprints.length));
   const selected = features.find((feature) => feature.properties.asset_id === state.selectedAssetId);
   map.getSource("selected-asset")?.setData({type: "FeatureCollection", features: selected ? [selected] : []});
   updateSpatialSelection(selected);
@@ -321,9 +362,9 @@ function renderMapPreviewLayer(feature) {
   const map = state.exploreMap;
   const mapElement = document.querySelector("#worldMap");
   if (!map || !mapElement) return;
-  if (!map.isStyleLoaded()) {
+  if (!map.getSource("assets")) {
     mapElement.dataset.previewStatus = "waiting-for-style";
-    map.once("idle", () => renderMapPreviewLayer(feature));
+    map.once("load", () => renderMapPreviewLayer(feature));
     return;
   }
   removeMapPreviewLayer(map);
@@ -370,12 +411,34 @@ function selectMapAsset(assetId, fit = false) {
   state.selectedAssetId = assetId;
   const features = filteredSpatialFeatures();
   renderSpatialAssetList(features); updateExploreMap(features, fit);
+  void hydrateSelectedSpatialFeature();
+}
+
+async function hydrateSelectedSpatialFeature() {
+  const assetId = state.selectedAssetId;
+  if (!assetId || state.exactSpatialAssetIds.has(assetId)) return;
+  const requestId = ++state.exactSpatialRequest;
+  try {
+    const exactFeature = await api(`/lake/spatial/assets/${encodeURIComponent(assetId)}`);
+    if (requestId !== state.exactSpatialRequest || assetId !== state.selectedAssetId || state.route !== "explore") return;
+    const index = state.spatialFeatures.findIndex((feature) => feature.properties.asset_id === assetId);
+    if (index < 0) return;
+    state.spatialFeatures[index] = exactFeature;
+    state.exactSpatialAssetIds.add(assetId);
+    const features = filteredSpatialFeatures();
+    renderSpatialAssetList(features);
+    updateExploreMap(features);
+  } catch (error) {
+    if (requestId === state.exactSpatialRequest) console.warn("Unable to load exact raster footprint", error);
+  }
 }
 
 async function renderEntities() {
   if (!state.resources.entities) {
-    const [entities, arrays] = await Promise.all([api("/lake/resources/entities"), api("/lake/resources/arrays")]);
-    state.resources.entities = entities; state.resources.arrays = arrays;
+    const [entities, arrayResources, arrays] = await Promise.all([
+      api("/lake/resources/entities"), api("/lake/resources/arrays"), api("/lake/arrays"),
+    ]);
+    state.resources.entities = entities; state.resources.arrays = arrayResources; state.arrays = arrays;
   }
   const entityFiles = state.resources.entities.items.filter((item) => item.kind === "file");
   main.innerHTML = pageHeader("Typed Resources", "实体与数组", "查看 basin、station、river、patch 等表格/矢量实体，以及已物化的 Zarr 数据仓。", `${entityFiles.length} 个实体文件 · ${state.arrays.length} 个 Zarr`) + `
@@ -406,12 +469,12 @@ function renderDownloads() {
     <section class="download-grid">
       <article class="panel">
         <header class="panel-header"><div><h2>新建采集</h2><p>搜索后直接写入 Earth Lake Source Layer</p></div></header>
-        <form id="downloadForm" class="download-form">
+        <form id="downloadForm" class="download-form" novalidate>
           <label class="field"><span>数据源</span><select name="catalog"><option value="nasa">NASA Earthdata</option><option value="earth-search">Earth Search</option><option value="microsoft">Microsoft Planetary Computer</option></select></label>
           <label class="field"><span>Collection / 产品</span><input name="collections" value="HLSL30_V2.0" required></label>
           <label class="field"><span>开始日期</span><input type="date" name="start_date" value="${start.toISOString().slice(0,10)}" required></label>
           <label class="field"><span>结束日期</span><input type="date" name="end_date" value="${today.toISOString().slice(0,10)}" required></label>
-          <label class="field"><span>最多条目</span><input type="number" name="max_items" min="1" max="500" value="3" required></label>
+          <label class="field"><span>最多条目（可选）</span><input type="number" name="max_items" min="1" placeholder="留空则自动分页至结束"></label>
           <label class="checkbox"><input type="checkbox" name="only_main" checked>只下载代表性资产</label>
           <label class="field wide"><span>AOI (WKT)</span><textarea name="wkt" required>POLYGON((-125 24,-66 24,-66 49,-125 49,-125 24))</textarea></label>
           <div class="form-actions wide"><span class="form-hint">NASA 受保护数据需要提前配置 ~/.netrc。未知远端文件大小时，ETA 可能不可用。</span><button class="primary-button" type="submit">开始下载</button></div>
@@ -419,16 +482,18 @@ function renderDownloads() {
       </article>
       <div>
         <article class="panel">
-          <header class="panel-header"><div><h2>实时任务</h2><p>API 进程内的下载状态</p></div><span class="mono muted">auto refresh</span></header>
+          <header class="panel-header"><div><h2>实时任务</h2><p>SQLite 持久化运行状态</p></div><span class="mono muted">auto refresh</span></header>
           <div id="tasksTable">${tasksTable(state.tasks)}</div>
         </article>
         <article class="panel">
-          <header class="panel-header"><div><h2>运行历史</h2><p>registry/processing_runs.parquet</p></div></header>
-          ${runsTable(state.runs, true)}
+          <header class="panel-header"><div><h2>运行历史</h2><p>支持游标分页和断点续查</p></div>${state.runCursor ? '<button class="quiet-button" id="loadMoreRuns">加载更多</button>' : ''}</header>
+          <div id="runsTable">${runsTable(state.runs, true)}</div>
         </article>
       </div>
     </section>`;
   document.querySelector("#downloadForm").addEventListener("submit", submitDownload);
+  document.querySelector("#loadMoreRuns")?.addEventListener("click", loadMoreRuns);
+  bindRunControls();
 }
 
 function tasksTable(tasks) {
@@ -438,7 +503,14 @@ function tasksTable(tasks) {
 
 function runsTable(runs, detailed) {
   if (!runs.length) return emptyState("R", "还没有运行记录", "CLI 和 API 下载都会自动维护 processing_runs。", "div");
-  return `<div class="table-wrap"><table class="data-table"><thead><tr><th>运行</th><th>状态</th><th>数据源</th><th>开始时间</th>${detailed ? "<th>输出</th>" : ""}</tr></thead><tbody>${runs.map((run) => `<tr><td class="mono" title="${run.run_id}">${shortId(run.run_id, 17)}</td><td>${badge(run.status)}</td><td>${escapeHtml(run.parameters?.catalog || "—")}</td><td>${formatDate(run.start_time)}</td>${detailed ? `<td>${run.output_asset_ids?.length || 0}</td>` : ""}</tr>`).join("")}</tbody></table></div>`;
+  return `<div class="table-wrap"><table class="data-table"><thead><tr><th>运行</th><th>状态</th><th>数据源</th><th>开始时间</th>${detailed ? "<th>进度</th><th>控制</th>" : ""}</tr></thead><tbody>${runs.map((run) => `<tr><td class="mono" title="${run.run_id}">${shortId(run.run_id, 17)}</td><td>${badge(run.status)}</td><td>${escapeHtml(run.request?.catalog || run.parameters?.catalog || "—")}</td><td>${formatDate(run.created_at || run.start_time)}</td>${detailed ? `<td class="mono">${Number(run.progress || 0).toFixed(1)}% · ${run.completed_files || 0}/${run.total_files || "?"}</td><td>${runActions(run)}</td>` : ""}</tr>`).join("")}</tbody></table></div>`;
+}
+
+function runActions(run) {
+  if (["queued","recovering","discovering","planning","downloading","finalizing"].includes(run.status)) return `<button class="table-action" data-run-action="pause" data-run-id="${run.run_id}">暂停</button><button class="table-action danger" data-run-action="cancel" data-run-id="${run.run_id}">取消</button>`;
+  if (["paused","auth_required"].includes(run.status)) return `<button class="table-action" data-run-action="resume" data-run-id="${run.run_id}">继续</button><button class="table-action danger" data-run-action="cancel" data-run-id="${run.run_id}">取消</button>`;
+  if (["failed","partial"].includes(run.status)) return `<button class="table-action" data-run-action="retry" data-run-id="${run.run_id}">重试失败项</button>`;
+  return '<span class="muted">—</span>';
 }
 
 async function submitDownload(event) {
@@ -446,17 +518,50 @@ async function submitDownload(event) {
   const form = event.currentTarget;
   const button = form.querySelector("button[type=submit]");
   const data = new FormData(form);
+  const required = [
+    ["collections", "Collection / 产品"],
+    ["start_date", "开始日期"],
+    ["end_date", "结束日期"],
+    ["wkt", "AOI (WKT)"],
+  ];
+  const missing = required.find(([name]) => !String(data.get(name) || "").trim());
+  if (missing) {
+    toast(`请填写：${missing[1]}`, "error");
+    form.querySelector(`[name="${missing[0]}"]`)?.focus();
+    return;
+  }
   const body = {
     catalog: data.get("catalog"), collections: data.get("collections").split(",").map((value) => value.trim()).filter(Boolean),
-    start_date: data.get("start_date"), end_date: data.get("end_date"), max_items: Number(data.get("max_items")), wkt: data.get("wkt"),
+    start_date: data.get("start_date"), end_date: data.get("end_date"), wkt: data.get("wkt"),
   };
+  if (data.get("max_items")) body.max_items = Number(data.get("max_items"));
   button.disabled = true; button.textContent = "正在创建…";
   try {
-    const result = await api(`/stac/search_and_download?only_main=${data.get("only_main") === "on"}`, {method: "POST", body: JSON.stringify(body)});
+    const result = await api(`/acquisitions?only_main=${data.get("only_main") === "on"}`, {method: "POST", headers: {"Content-Type": "application/json", "Idempotency-Key": idempotencyKey()}, body: JSON.stringify(body)});
     toast(`任务已创建：${shortId(result.task_id)}`);
     await refreshTasks(); renderDownloads();
   } catch (error) { toast(`创建失败：${error.message}`, "error"); }
   finally { button.disabled = false; button.textContent = "开始下载"; }
+}
+
+async function loadMoreRuns() {
+  if (!state.runCursor) return;
+  const page = await api(`/acquisitions?limit=50&cursor=${encodeURIComponent(state.runCursor)}`);
+  state.runs.push(...page.items); state.runCursor = page.next_cursor;
+  renderDownloads();
+}
+
+function bindRunControls() {
+  document.querySelectorAll("[data-run-action]").forEach((button) => button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      await api(`/acquisitions/${encodeURIComponent(button.dataset.runId)}/${button.dataset.runAction}`, {method: "POST"});
+      toast(`运行已${{pause:"暂停",resume:"继续",cancel:"取消",retry:"进入重试队列"}[button.dataset.runAction]}`);
+      await refreshTasks();
+      const page = await api("/acquisitions?limit=50"); state.runs = page.items; state.runCursor = page.next_cursor;
+      renderDownloads();
+    } catch (error) { toast(`操作失败：${error.message}`, "error"); button.disabled = false; }
+  }));
 }
 
 async function renderSystem() {
@@ -588,7 +693,7 @@ async function refreshTasks() {
     state.tasks = tasks;
     state.pollTick += 1;
     if (state.pollTick % 6 === 0 || (previousActive && !active)) {
-      state.runs = (await api("/lake/runs?limit=200")).items;
+      const page = await api("/acquisitions?limit=50"); state.runs = page.items; state.runCursor = page.next_cursor;
     }
     updateTransferDock();
     if (state.route === "downloads") {

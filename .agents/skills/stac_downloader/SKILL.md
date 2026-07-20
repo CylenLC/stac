@@ -29,12 +29,38 @@ describing commands:
 
 1. Collect or infer the required catalog, collection ID, WKT geometry, date
    range, result limit, and whether to download main assets only or all assets.
-2. Run `search` and save the results to a JSON file.
-3. Run `download` using the saved JSON file.
-4. Report the downloaded paths, protocol root, processing run ID, and failures.
+2. Choose a stable, explicit idempotency key for the user's submission.
+3. Run `acquire`; it persists catalog pages, plans bounded asset batches, and downloads them.
+4. Report the Acquisition Run ID, terminal status, downloaded paths, and failures.
 
 Ask for missing information only when it cannot be reasonably inferred. A
 download request needs at least a collection and a geographic area.
+
+## Durable Acquire (Default)
+
+```bash
+uv run python .agents/skills/stac_downloader/scripts/stac_tool.py acquire \
+  --catalog nasa \
+  --wkt "POLYGON ((-125 24,-66 24,-66 49,-125 49,-125 24))" \
+  --collections "HLSL30_V2.0,HLSS30_V2.0" \
+  --start "2024-01-01" \
+  --end "2024-01-03" \
+  --max 10 \
+  --outdir downloads \
+  --idempotency-key hls-us-sample-2024-01-01
+```
+
+Omit `--max` to follow catalog pages until exhausted. Add `--all` to download
+all data assets. Interrupted transfers retain `.part` files and continue with
+HTTP Range requests when the server supports them. Mutable checkpoints are in
+`registry/acquisition_state.sqlite`; immutable request and Search Page snapshots
+are in `manifests/acquisitions/<run_id>/`.
+
+Use a new idempotency key for an intentional rerun. Reusing a key with the same
+request returns the existing run; reusing it with different parameters is an error.
+
+The separate `search` and `download` commands below remain available for manual,
+non-paged JSON workflows, but Agent downloads should use `acquire`.
 
 ## Search
 

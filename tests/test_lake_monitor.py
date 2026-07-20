@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import rasterio
@@ -46,6 +47,8 @@ class LakeMonitorTests(unittest.TestCase):
                 status="downloaded",
             )
             lake.finish_run(run_id, "completed", [asset_id])
+            (asset_path.parent / "._scene.B04.tif").write_bytes(b"macOS metadata")
+            (asset_path.parent / ".DS_Store").write_bytes(b"macOS metadata")
 
             monitor = LakeMonitor(directory)
             summary = monitor.summary()
@@ -138,6 +141,23 @@ class LakeMonitorTests(unittest.TestCase):
                 feature["properties"]["preview_coordinates"] + [feature["properties"]["preview_coordinates"][0]],
             )
             self.assertEqual(len(list((Path(directory) / "cache" / "footprints").glob("*.geojson"))), 1)
+
+            with patch("lake_monitor.valid_data_footprint", side_effect=AssertionError("source raster accessed")):
+                lightweight = LakeMonitor(directory).spatial_assets(exact=False)["features"][0]
+            self.assertEqual(lightweight["properties"]["geometry_source"], "raster_grid")
+            self.assertEqual(lightweight["properties"]["preview_cache_key"], feature["properties"]["preview_cache_key"])
+
+    def test_protocol_ignores_macos_appledouble_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lake = EarthLake(directory)
+            protocol_dir = Path(directory) / "protocol"
+            (protocol_dir / "collection.json").write_text('{"title": "HLS"}', encoding="utf-8")
+            (protocol_dir / "._collection.json").write_bytes(b"\x00\x05\x16\x07macOS metadata")
+
+            documents = LakeMonitor(directory).protocol()
+
+            self.assertEqual(documents["collection.json"], {"title": "HLS"})
+            self.assertNotIn("._collection.json", documents)
 
     def test_valid_data_footprint_drops_internal_nodata_holes(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1,5 +1,6 @@
 """Shared catalog search and download helpers for the API and CLI."""
 
+import json
 import os
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -186,6 +187,62 @@ def search_items(
     return [item.to_dict() for item in search.items()]
 
 
+def search_items_page(
+    catalog: str,
+    wkt: str,
+    collections: list[str],
+    start_date: str,
+    end_date: str,
+    cursor: str | None,
+    page_size: int = 100,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Fetch a resumable logical page without imposing a 500-item run limit."""
+    if catalog == "nasa":
+        state = json.loads(cursor) if cursor else {"collection_index": 0, "page_num": 1}
+        collection_index = int(state["collection_index"])
+        if collection_index >= len(collections):
+            return [], None
+        collection = collections[collection_index]
+        short_name, version = NASA_COLLECTIONS.get(collection, (collection, None))
+        bbox = load_wkt(wkt).bounds
+        params: dict[str, Any] = {
+            "short_name": short_name,
+            "bounding_box": f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}",
+            "temporal": f"{start_date}T00:00:00Z,{end_date}T23:59:59Z",
+            "page_size": page_size,
+            "page_num": int(state["page_num"]),
+        }
+        if version:
+            params["version"] = version
+        response = http_session().get(NASA_CMR_URL, params=params, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        entries = response.json().get("feed", {}).get("entry", [])
+        items = []
+        for entry in entries:
+            geometry, item_bbox = cmr_geometry(entry)
+            items.append({
+                "id": entry.get("id"), "collection": collection, "bbox": item_bbox,
+                "geometry": geometry,
+                "properties": {
+                    "datetime": entry.get("time_start"), "cloud_cover": entry.get("cloud_cover"),
+                    "producer_granule_id": entry.get("producer_granule_id"),
+                },
+                "assets": nasa_assets(entry.get("links", [])),
+            })
+        if len(entries) == page_size:
+            outgoing_state = {"collection_index": collection_index, "page_num": int(state["page_num"]) + 1}
+        elif collection_index + 1 < len(collections):
+            outgoing_state = {"collection_index": collection_index + 1, "page_num": 1}
+        else:
+            outgoing_state = None
+        return items, json.dumps(outgoing_state, separators=(",", ":")) if outgoing_state else None
+
+    offset = int(cursor or 0)
+    items = search_items(catalog, wkt, collections, start_date, end_date, offset + page_size)
+    page = items[offset : offset + page_size]
+    return page, str(offset + len(page)) if len(page) == page_size else None
+
+
 def get_collection_metadata(catalog: str, collection: str) -> dict[str, Any]:
     """Fetch one authoritative STAC Collection or CMR collection record."""
     if catalog == "nasa":
@@ -248,10 +305,14 @@ def download_asset(
 ) -> int:
     temporary = destination.with_name(f"{destination.name}.part")
     downloaded = 0
+    existing = temporary.stat().st_size if temporary.exists() else 0
+    headers = {"Range": f"bytes={existing}-"} if existing else {}
     try:
-        with session.get(url, stream=True, timeout=REQUEST_TIMEOUT) as response:
+        with session.get(url, stream=True, timeout=REQUEST_TIMEOUT, headers=headers) as response:
             response.raise_for_status()
-            with open(temporary, "wb") as file:
+            resumed = existing > 0 and response.status_code == 206
+            mode = "ab" if resumed else "wb"
+            with open(temporary, mode) as file:
                 for chunk in response.iter_content(chunk_size=64 * 1024):
                     if chunk:
                         file.write(chunk)
@@ -261,5 +322,4 @@ def download_asset(
         os.replace(temporary, destination)
         return downloaded
     except Exception:
-        temporary.unlink(missing_ok=True)
         raise

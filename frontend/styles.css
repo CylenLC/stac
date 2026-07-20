@@ -203,6 +203,10 @@ main { padding: 28px 30px 100px; max-width: 1540px; margin: 0 auto; }
 .form-hint { margin-right: auto; color: var(--muted); font-size: 9px; line-height: 1.5; }
 .progress-cell { min-width: 130px; }
 .progress-cell .bar-track { margin-top: 5px; }
+.table-action { margin: 2px 4px 2px 0; padding: 5px 8px; border: 1px solid var(--line-strong); border-radius: 6px; background: #fff; color: var(--accent-dark); cursor: pointer; font-size: 9px; }
+.table-action:hover { background: var(--accent-soft); }
+.table-action.danger { color: var(--red); }
+.table-action:disabled { opacity: .5; cursor: wait; }
 
 .schema-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px 16px; }
 .definition { padding: 9px 0; border-bottom: 1px solid var(--line); }

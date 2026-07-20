@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import time
 import uuid
 from datetime import date, datetime
@@ -7,7 +8,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import requests
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -29,6 +30,7 @@ from stac_core import (
     search_items,
     selected_assets,
 )
+from acquisition import AcquisitionManager, AcquisitionRequest
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("stac_api")
@@ -39,8 +41,9 @@ app = FastAPI(
     version="1.2.0",
 )
 
-DOWNLOAD_DIR = "downloads"
-Path(DOWNLOAD_DIR).mkdir(exist_ok=True)
+DEFAULT_DOWNLOAD_DIR = Path("/Volumes/Untitled/stac")
+DOWNLOAD_DIR = Path(os.environ.get("EARTH_LAKE_ROOT", str(DEFAULT_DOWNLOAD_DIR))).expanduser().resolve()
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 FRONTEND_DIR = Path(__file__).parent / "frontend"
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 TASKS: dict[str, dict[str, Any]] = {}
@@ -52,7 +55,7 @@ class SearchRequest(BaseModel):
     start_date: date = Field(..., description="Start date (YYYY-MM-DD)")
     end_date: date = Field(..., description="End date (YYYY-MM-DD)")
     catalog: Literal["microsoft", "earth-search", "nasa"] = "microsoft"
-    max_items: int = Field(100, ge=1, le=500, description="Maximum items per collection")
+    max_items: int | None = Field(None, ge=1, description="Optional total item limit; omit to follow all pages")
 
     @field_validator("wkt")
     @classmethod
@@ -106,7 +109,7 @@ class CollectionInfo(BaseModel):
 
 class TaskStatus(BaseModel):
     task_id: str
-    status: Literal["pending", "searching", "downloading", "completed", "partial", "failed"]
+    status: Literal["pending", "queued", "recovering", "searching", "discovering", "planning", "downloading", "finalizing", "paused", "auth_required", "cancelling", "cancelled", "completed", "partial", "failed"]
     progress: float
     message: str
     start_time: float | None = None
@@ -124,8 +127,33 @@ class TaskStatus(BaseModel):
     protocol_root: str | None = None
 
 
+def acquisition_manager() -> AcquisitionManager:
+    return AcquisitionManager(DOWNLOAD_DIR)
+
+
+@app.on_event("startup")
+def start_acquisition_scheduler() -> None:
+    manager = acquisition_manager()
+    manager.start_scheduler()
+    app.state.acquisition_manager = manager
+    monitor = LakeMonitor(DOWNLOAD_DIR)
+    monitor.warm_registry()
+    app.state.lake_monitor = monitor
+
+
+@app.on_event("shutdown")
+def stop_acquisition_scheduler() -> None:
+    manager = getattr(app.state, "acquisition_manager", None)
+    if manager:
+        manager.stop_scheduler()
+
+
 def lake_monitor() -> LakeMonitor:
-    return LakeMonitor(DOWNLOAD_DIR)
+    monitor = getattr(app.state, "lake_monitor", None)
+    if monitor is None:
+        monitor = LakeMonitor(DOWNLOAD_DIR)
+        app.state.lake_monitor = monitor
+    return monitor
 
 
 def task_status(task_id: str, data: dict[str, Any]) -> TaskStatus:
@@ -337,8 +365,8 @@ def monitor_frontend() -> FileResponse:
 
 
 @app.get("/lake/summary")
-def get_lake_summary() -> dict[str, Any]:
-    return lake_monitor().summary()
+def get_lake_summary(scan_filesystem: bool = False) -> dict[str, Any]:
+    return lake_monitor().summary(scan_filesystem=scan_filesystem)
 
 
 @app.get("/lake/products")
@@ -377,13 +405,23 @@ def get_spatial_assets(
     variable: str | None = None,
     status: str | None = None,
     q: str | None = None,
+    exact: bool = False,
 ) -> dict[str, Any]:
     return lake_monitor().spatial_assets(
         product_id=product_id,
         variable=variable,
         status=status,
         query=q,
+        exact=exact,
     )
+
+
+@app.get("/lake/spatial/assets/{asset_id}")
+def get_spatial_asset(asset_id: str) -> dict[str, Any]:
+    feature = lake_monitor().spatial_asset(asset_id, exact=True)
+    if feature is None:
+        raise HTTPException(status_code=404, detail="Spatial asset not found")
+    return feature
 
 
 @app.get("/lake/previews/{asset_id}.png")
@@ -541,28 +579,22 @@ def search_and_download(
     req: SearchRequest,
     background_tasks: BackgroundTasks,
     only_main: bool = Query(True, description="Download representative assets only"),
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
 ) -> dict[str, str]:
-    task_id = str(uuid.uuid4())
-    TASKS[task_id] = {
-        "status": "pending",
-        "progress": 0.0,
-        "message": "Task queued.",
-        "results": [],
-        "skipped": [],
-        "failures": [],
-        "total_files": 0,
-        "completed_files": 0,
-        "current_file": None,
-        "run_id": None,
-        "protocol_root": str(Path(DOWNLOAD_DIR).resolve()),
-    }
-    background_tasks.add_task(workflow_worker, task_id, req, only_main)
-    return {"task_id": task_id, "message": "Workflow started. Use /stac/tasks/{task_id} to track progress."}
+    manager = acquisition_manager()
+    request = AcquisitionRequest(
+        catalog=req.catalog, collections=req.collections, wkt=req.wkt,
+        start_date=req.start_date.isoformat(), end_date=req.end_date.isoformat(),
+        max_items=req.max_items, only_main=only_main,
+    )
+    task_id = manager.create_run(request, idempotency_key or str(uuid.uuid4()))
+    return {"task_id": task_id, "run_id": task_id, "message": "Acquisition queued. Use /acquisitions/{run_id} to track progress."}
 
 
 @app.get("/stac/tasks", response_model=list[TaskStatus])
 def list_tasks() -> list[TaskStatus]:
-    return [
+    persisted = [_run_task(run) for run in acquisition_manager().list_runs(limit=200)["items"]]
+    legacy = [
         task_status(task_id, data)
         for task_id, data in sorted(
             TASKS.items(),
@@ -570,13 +602,93 @@ def list_tasks() -> list[TaskStatus]:
             reverse=True,
         )
     ]
+    persisted_ids = {task.task_id for task in persisted}
+    return persisted + [task for task in legacy if task.task_id not in persisted_ids]
 
 
 @app.get("/stac/tasks/{task_id}", response_model=TaskStatus)
 def get_task_status(task_id: str) -> TaskStatus:
-    if task_id not in TASKS:
-        raise HTTPException(status_code=404, detail="Task not found")
-    return task_status(task_id, TASKS[task_id])
+    if task_id in TASKS:
+        return task_status(task_id, TASKS[task_id])
+    try:
+        return _run_task(acquisition_manager().get_run(task_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Task not found") from exc
+
+
+def _run_task(run: dict[str, Any]) -> TaskStatus:
+    status = "searching" if run["status"] == "discovering" else run["status"]
+    started = datetime.fromisoformat(run["started_at"]).timestamp() if run.get("started_at") else None
+    return TaskStatus(
+        task_id=run["run_id"], run_id=run["run_id"], status=status,
+        progress=run["progress"], message=run["message"], start_time=started,
+        total_bytes=run["total_bytes"], downloaded_bytes=run["downloaded_bytes"],
+        total_files=run["total_files"], completed_files=run["completed_files"],
+        current_file=run["current_file"], failures=[run["error"]] if run.get("error") else [],
+        protocol_root=str(Path(DOWNLOAD_DIR).resolve()),
+    )
+
+
+@app.post("/acquisitions", status_code=202)
+def create_acquisition(
+    req: SearchRequest,
+    background_tasks: BackgroundTasks,
+    only_main: bool = Query(True),
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+) -> dict[str, Any]:
+    return search_and_download(req, background_tasks, only_main, idempotency_key)
+
+
+@app.get("/acquisitions")
+def list_acquisitions(cursor: str | None = None, limit: Annotated[int, Query(ge=1, le=200)] = 50) -> dict[str, Any]:
+    return acquisition_manager().list_runs(cursor, limit)
+
+
+@app.get("/acquisitions/{run_id}")
+def get_acquisition(run_id: str) -> dict[str, Any]:
+    try:
+        run = acquisition_manager().get_run(run_id)
+        run["batches"] = acquisition_manager().list_batches(run_id)
+        return run
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Acquisition Run not found") from exc
+
+
+def _control_run(run_id: str, action: str) -> dict[str, Any]:
+    manager = acquisition_manager()
+    try:
+        return getattr(manager, f"{action}_run")(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Acquisition Run not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/acquisitions/{run_id}/pause")
+def pause_acquisition(run_id: str) -> dict[str, Any]:
+    return _control_run(run_id, "pause")
+
+
+@app.post("/acquisitions/{run_id}/resume")
+def resume_acquisition(run_id: str, background_tasks: BackgroundTasks) -> dict[str, Any]:
+    run = _control_run(run_id, "resume")
+    return run
+
+
+@app.post("/acquisitions/{run_id}/cancel")
+def cancel_acquisition(run_id: str) -> dict[str, Any]:
+    return _control_run(run_id, "cancel")
+
+
+@app.post("/acquisitions/{run_id}/retry")
+def retry_acquisition(run_id: str) -> dict[str, Any]:
+    manager = acquisition_manager()
+    try:
+        return manager.retry_failed(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Acquisition Run not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 if __name__ == "__main__":

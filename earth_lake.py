@@ -468,8 +468,10 @@ class EarthLake:
             raise ValueError("Source path escapes the Earth Lake root")
         return path
 
-    def start_run(self, parameters: dict[str, Any]) -> str:
-        run_id = f"run-{uuid.uuid4()}"
+    def start_run(self, parameters: dict[str, Any], run_id: str | None = None) -> str:
+        run_id = run_id or f"run-{uuid.uuid4()}"
+        if self._find("processing_runs", run_id):
+            return run_id
         self._upsert(
             "processing_runs",
             {
@@ -486,6 +488,9 @@ class EarthLake:
             },
         )
         return run_id
+
+    def output_asset_ids(self, run_id: str) -> list[str]:
+        return [str(row["asset_id"]) for row in self._read_rows("assets") if row.get("run_id") == run_id]
 
     def finish_run(self, run_id: str, status: str, output_asset_ids: list[str]) -> None:
         row = self._find("processing_runs", run_id)

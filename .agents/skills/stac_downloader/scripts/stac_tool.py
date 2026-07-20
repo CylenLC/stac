@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -8,6 +9,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from earth_lake import EarthLake
+from acquisition import AcquisitionManager, AcquisitionRequest
 from stac_core import (
     asset_filename,
     download_asset,
@@ -18,6 +20,9 @@ from stac_core import (
     search_items,
     selected_assets,
 )
+
+
+DEFAULT_OUTPUT_DIR = os.environ.get("EARTH_LAKE_ROOT", "/Volumes/Untitled/stac")
 
 
 def search(catalog: str, wkt: str, collections: list[str], start: str, end: str, max_items: int) -> list[dict]:
@@ -121,10 +126,38 @@ def main() -> int:
     download_parser = subparsers.add_parser("download")
     download_parser.add_argument("--input", required=True)
     download_parser.add_argument("--catalog", default="microsoft", choices=["microsoft", "earth-search", "nasa"])
-    download_parser.add_argument("--outdir", default="downloads")
+    download_parser.add_argument("--outdir", default=DEFAULT_OUTPUT_DIR)
     download_parser.add_argument("--all", action="store_true")
 
+    acquire_parser = subparsers.add_parser("acquire", help="Create and execute a durable Acquisition Run")
+    acquire_parser.add_argument("--wkt", required=True)
+    acquire_parser.add_argument("--collections", required=True)
+    acquire_parser.add_argument("--start", required=True)
+    acquire_parser.add_argument("--end", required=True)
+    acquire_parser.add_argument("--catalog", default="nasa", choices=["microsoft", "earth-search", "nasa"])
+    acquire_parser.add_argument("--max", type=int)
+    acquire_parser.add_argument("--outdir", default=DEFAULT_OUTPUT_DIR)
+    acquire_parser.add_argument("--all", action="store_true")
+    acquire_parser.add_argument("--idempotency-key", required=True)
+
     args = parser.parse_args()
+    if args.command == "acquire":
+        collections = [value.strip() for value in args.collections.split(",") if value.strip()]
+        if not collections:
+            parser.error("--collections must include at least one collection")
+        manager = AcquisitionManager(args.outdir)
+        run_id = manager.create_run(
+            AcquisitionRequest(
+                catalog=args.catalog, collections=collections, wkt=args.wkt,
+                start_date=args.start, end_date=args.end, max_items=args.max,
+                only_main=not args.all,
+            ),
+            args.idempotency_key,
+        )
+        print(f"Acquisition Run: {run_id}")
+        result = manager.run(run_id)
+        print(json.dumps(result, indent=2))
+        return 0 if result["status"] == "completed" else 1
     if args.command == "search":
         if args.max < 1:
             parser.error("--max must be at least 1")
