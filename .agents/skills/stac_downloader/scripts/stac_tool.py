@@ -11,15 +11,19 @@ if str(PROJECT_ROOT) not in sys.path:
 from earth_lake import EarthLake
 from acquisition import AcquisitionManager, AcquisitionRequest
 from stac_core import (
-    asset_filename,
-    download_asset,
+    AssetResolutionError,
+    canonical_asset_path,
+    classify_asset,
+    download_asset_checked,
     get_collection_metadata,
     get_asset_size,
     http_session,
     resolve_asset_url,
     search_items,
-    selected_assets,
+    resolve_assets,
 )
+from stac_identity import AssetIdentity
+from stac_integrity import IntegrityGate
 
 
 DEFAULT_OUTPUT_DIR = os.environ.get("EARTH_LAKE_ROOT", "/Volumes/Untitled/stac")
@@ -32,7 +36,13 @@ def search(catalog: str, wkt: str, collections: list[str], start: str, end: str,
     return items
 
 
-def download(catalog: str, items: list[dict], output_dir: str, only_main: bool) -> int:
+def download(
+    catalog: str,
+    items: list[dict],
+    output_dir: str,
+    only_main: bool,
+    asset_keys: list[str] | None = None,
+) -> int:
     lake = EarthLake(output_dir)
     run_id = lake.start_run(
         {"interface": "cli", "catalog": catalog, "only_main": only_main, "item_count": len(items)}
@@ -50,9 +60,13 @@ def download(catalog: str, items: list[dict], output_dir: str, only_main: bool) 
             print(f"  [Warning] Could not fetch metadata for {collection}: {exc}", file=sys.stderr)
 
     for item in items:
-        assets = list(selected_assets(item, only_main))
-        if not assets:
-            failures.append(f"{item.get('id', 'unknown')}: no matching downloadable assets")
+        selector = "explicit" if asset_keys is not None else "main" if only_main else "all"
+        try:
+            resolution = resolve_assets(item, catalog, mode=selector, asset_keys=asset_keys)
+            assets = list(resolution.selected)
+        except AssetResolutionError as exc:
+            failures.append(str(exc))
+            print(f"  [Error] {failures[-1]}", file=sys.stderr)
             continue
         for key, asset in assets:
             try:
@@ -61,30 +75,40 @@ def download(catalog: str, items: list[dict], output_dir: str, only_main: bool) 
                 metadata_path = directory / "metadata.json"
                 if not metadata_path.exists():
                     metadata_path.write_text(json.dumps(item, indent=2), encoding="utf-8")
-                destination = directory / asset_filename(key, asset)
+                identity = AssetIdentity.from_item(catalog, item, key)
+                destination = canonical_asset_path(lake.root, identity, asset)
                 url = resolve_asset_url(asset, catalog)
                 expected_size = get_asset_size(session, url)
                 if destination.exists():
-                    actual_size = destination.stat().st_size
-                    if expected_size and actual_size != expected_size:
-                        raise ValueError(f"existing file size {actual_size} does not match expected {expected_size}")
-                    skipped += 1
-                    print(f"  [Skip] {destination.name} exists.")
-                    output_asset_ids.append(
-                        lake.record_asset(
-                            run_id=run_id,
-                            catalog=catalog,
-                            item=item,
-                            asset_key=key,
-                            source_url=asset.get("href", ""),
-                            local_path=destination,
-                            status="skipped",
-                            collection_metadata=collection_metadata_by_id.get(item.get("collection")),
+                    cache_result = IntegrityGate.validate(destination, asset, expected_size=expected_size or None)
+                    if cache_result.ok:
+                        skipped += 1
+                        print(f"  [Skip] {destination.name} exists and passed integrity checks.")
+                        output_asset_ids.append(
+                            lake.record_asset(
+                                run_id=run_id,
+                                catalog=catalog,
+                                item=item,
+                                asset_key=key,
+                                source_url=asset.get("href", ""),
+                                local_path=destination,
+                                status="skipped",
+                                collection_metadata=collection_metadata_by_id.get(item.get("collection")),
+                                integrity=cache_result,
+                                asset_category=classify_asset(key, asset),
+                            )
                         )
-                    )
-                    continue
+                        continue
+                    print(f"  [Warning] Existing cache failed integrity checks; replacing it: {cache_result}", file=sys.stderr)
                 print(f"  [Downloading] {destination.name} ...")
-                download_asset(session, url, destination)
+                integrity = download_asset_checked(
+                    session,
+                    url,
+                    destination,
+                    asset_metadata=asset,
+                    expected_size=expected_size or None,
+                    asset_identity=identity,
+                )
                 output_asset_ids.append(
                     lake.record_asset(
                         run_id=run_id,
@@ -95,6 +119,8 @@ def download(catalog: str, items: list[dict], output_dir: str, only_main: bool) 
                         local_path=destination,
                         status="downloaded",
                         collection_metadata=collection_metadata_by_id.get(item.get("collection")),
+                        integrity=integrity,
+                        asset_category=classify_asset(key, asset),
                     )
                 )
                 downloaded += 1
@@ -128,6 +154,7 @@ def main() -> int:
     download_parser.add_argument("--catalog", default="microsoft", choices=["microsoft", "earth-search", "nasa"])
     download_parser.add_argument("--outdir", default=DEFAULT_OUTPUT_DIR)
     download_parser.add_argument("--all", action="store_true")
+    download_parser.add_argument("--asset", dest="asset_keys", action="append", help="Explicit Asset key; repeat for multiple keys")
 
     acquire_parser = subparsers.add_parser("acquire", help="Create and execute a durable Acquisition Run")
     acquire_parser.add_argument("--wkt", required=True)
@@ -138,6 +165,7 @@ def main() -> int:
     acquire_parser.add_argument("--max", type=int)
     acquire_parser.add_argument("--outdir", default=DEFAULT_OUTPUT_DIR)
     acquire_parser.add_argument("--all", action="store_true")
+    acquire_parser.add_argument("--asset", dest="asset_keys", action="append", help="Explicit Asset key; repeat for multiple keys")
     acquire_parser.add_argument("--idempotency-key", required=True)
 
     args = parser.parse_args()
@@ -151,6 +179,7 @@ def main() -> int:
                 catalog=args.catalog, collections=collections, wkt=args.wkt,
                 start_date=args.start, end_date=args.end, max_items=args.max,
                 only_main=not args.all,
+                asset_keys=args.asset_keys,
             ),
             args.idempotency_key,
         )
@@ -173,7 +202,7 @@ def main() -> int:
         return 0
 
     items = json.loads(Path(args.input).read_text(encoding="utf-8"))
-    return download(args.catalog, items, args.outdir, not args.all)
+    return download(args.catalog, items, args.outdir, not args.all, args.asset_keys)
 
 
 if __name__ == "__main__":

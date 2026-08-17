@@ -1,12 +1,31 @@
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import pyarrow.parquet as pq
-
 import stac_core
 import stac_api
+from stac_identity import AssetIdentity
+
+
+def write_part_metadata(part: Path, destination: Path, identity: AssetIdentity, *, etag: str, remote_total: int) -> None:
+    digest = hashlib.sha256(part.read_bytes()).hexdigest()
+    part.with_name(f"{part.name}.meta").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "identity": identity.digest(),
+                "destination": str(destination.resolve()),
+                "partial_size": part.stat().st_size,
+                "partial_sha256": digest,
+                "remote_total": remote_total,
+                "etag": etag,
+                "last_modified": None,
+            }
+        )
+    )
 
 
 class FakeResponse:
@@ -50,6 +69,43 @@ class FakeSession:
 
 
 class StacCoreTests(unittest.TestCase):
+    def test_acquisition_manager_is_application_singleton(self):
+        sentinel = object()
+        original = getattr(stac_api.app.state, "acquisition_manager", sentinel)
+        if original is not sentinel:
+            delattr(stac_api.app.state, "acquisition_manager")
+        try:
+            with patch.object(stac_api, "AcquisitionManager") as constructor:
+                manager = object()
+                constructor.return_value = manager
+
+                self.assertIs(stac_api.acquisition_manager(), manager)
+                self.assertIs(stac_api.acquisition_manager(), manager)
+                constructor.assert_called_once_with(stac_api.DOWNLOAD_DIR)
+        finally:
+            if hasattr(stac_api.app.state, "acquisition_manager"):
+                delattr(stac_api.app.state, "acquisition_manager")
+            if original is not sentinel:
+                stac_api.app.state.acquisition_manager = original
+
+    def test_task_list_reconciles_on_each_call(self):
+        class Manager:
+            calls = 0
+
+            def list_runs(self, limit):
+                self.calls += 1
+                return {"items": []}
+
+        manager = Manager()
+        stac_api.invalidate_task_list_cache()
+        try:
+            with patch.object(stac_api, "acquisition_manager", return_value=manager):
+                self.assertEqual(stac_api.list_tasks(), [])
+                self.assertEqual(stac_api.list_tasks(), [])
+            self.assertEqual(manager.calls, 2)
+        finally:
+            stac_api.invalidate_task_list_cache()
+
     def test_hls_alias_returns_all_data_assets(self):
         payload = {
             "feed": {
@@ -116,7 +172,9 @@ class StacCoreTests(unittest.TestCase):
     def test_item_directory_sanitizes_user_controlled_components(self):
         with tempfile.TemporaryDirectory() as directory:
             path = stac_core.item_directory(directory, "../../outside", "../item")
-            self.assertEqual(path, Path(directory).resolve() / "outside" / "item")
+            self.assertTrue(path.is_relative_to(Path(directory).resolve()))
+            self.assertIn("__", path.parts[-1])
+            self.assertIn("__", path.parts[-2])
 
     def test_hls_main_assets_use_sensor_specific_nir_band(self):
         l30 = {
@@ -140,12 +198,27 @@ class StacCoreTests(unittest.TestCase):
             self.assertFalse((Path(directory) / "asset.tif.part").exists())
 
     def test_download_asset_resumes_part_file_with_range(self):
-        response = FakeResponse(chunks=(b"two",), status_code=206, headers={"ETag": '"v1"'})
+        response = FakeResponse(
+            chunks=(b"two",),
+            status_code=206,
+            headers={"ETag": '"v1"', "Content-Length": "3", "Content-Range": "bytes 3-5/6"},
+        )
         session = FakeSession(response)
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "asset.tif"
-            destination.with_name("asset.tif.part").write_bytes(b"one")
-            self.assertEqual(stac_core.download_asset(session, "https://example/asset", destination), 3)
+            identity = AssetIdentity("test", "collection", "item", "data")
+            part = destination.with_name("asset.tif.part")
+            part.write_bytes(b"one")
+            write_part_metadata(part, destination, identity, etag='"v1"', remote_total=6)
+            self.assertEqual(
+                stac_core.download_asset(
+                    session,
+                    "https://example/asset",
+                    destination,
+                    asset_identity=identity,
+                ),
+                3,
+            )
             self.assertEqual(session.get_kwargs["headers"]["Range"], "bytes=3-")
             self.assertEqual(destination.read_bytes(), b"onetwo")
 
@@ -157,79 +230,7 @@ class StacCoreTests(unittest.TestCase):
             destination.with_name("asset.tif.part").write_bytes(b"partial")
             with self.assertRaises(OSError):
                 stac_core.download_asset(session, "https://example/asset", destination)
-            self.assertEqual(destination.with_name("asset.tif.part").read_bytes(), b"partial")
-
-    def test_api_marks_all_download_failures_as_failed(self):
-        task_id = "test-task"
-        stac_api.TASKS[task_id] = {
-            "status": "pending",
-            "progress": 0.0,
-            "message": "queued",
-            "results": [],
-            "skipped": [],
-            "failures": [],
-        }
-        items = [{"id": "item", "collection": "collection", "assets": {"data": {"href": "https://example/data.tif"}}}]
-        with tempfile.TemporaryDirectory() as directory:
-            response = FakeResponse(status_error=None)
-            with (
-                patch.object(stac_api, "DOWNLOAD_DIR", directory),
-                patch("stac_api.http_session", return_value=FakeSession(response)),
-                patch("stac_api.download_asset", side_effect=OSError("network interrupted")),
-                patch.object(stac_api.logger, "exception"),
-            ):
-                stac_api.download_worker(task_id, "nasa", items, only_main=False)
-
-        self.assertEqual(stac_api.TASKS[task_id]["status"], "failed")
-        self.assertEqual(len(stac_api.TASKS[task_id]["failures"]), 1)
-        del stac_api.TASKS[task_id]
-
-    def test_api_success_updates_earth_lake_registry(self):
-        task_id = "successful-task"
-        stac_api.TASKS[task_id] = {
-            "status": "pending",
-            "progress": 0.0,
-            "message": "queued",
-            "results": [],
-            "skipped": [],
-            "failures": [],
-        }
-        item = {
-            "id": "granule-1",
-            "collection": "HLSL30_V2.0",
-            "bbox": [-101.0, 39.0, -99.0, 41.0],
-            "geometry": {
-                "type": "Polygon",
-                "coordinates": [[[-101.0, 39.0], [-99.0, 39.0], [-99.0, 41.0], [-101.0, 41.0], [-101.0, 39.0]]],
-            },
-            "properties": {"datetime": "2024-01-01T12:00:00Z"},
-            "assets": {"B04": {"href": "https://example/scene.B04.tif", "roles": ["data"]}},
-        }
-
-        def successful_download(session, url, destination, on_chunk):
-            destination.write_bytes(b"downloaded-data")
-            on_chunk(len(b"downloaded-data"))
-            return len(b"downloaded-data")
-
-        with tempfile.TemporaryDirectory() as directory:
-            with (
-                patch.object(stac_api, "DOWNLOAD_DIR", directory),
-                patch("stac_api.http_session", return_value=FakeSession(FakeResponse())),
-                patch("stac_api.download_asset", side_effect=successful_download),
-            ):
-                asset_ids = stac_api.download_worker(task_id, "nasa", [item], only_main=False)
-
-            self.assertEqual(stac_api.TASKS[task_id]["status"], "completed")
-            self.assertEqual(stac_api.TASKS[task_id]["total_files"], 1)
-            self.assertEqual(stac_api.TASKS[task_id]["completed_files"], 1)
-            self.assertIsNone(stac_api.TASKS[task_id]["current_file"])
-            self.assertEqual(len(asset_ids), 1)
-            assets = pq.read_table(Path(directory) / "registry" / "assets.parquet").to_pylist()
-            self.assertEqual(len(assets), 1)
-            self.assertEqual(assets[0]["asset_key"], "B04")
-            self.assertTrue((Path(directory) / "catalog" / "stac" / "catalog.json").exists())
-        del stac_api.TASKS[task_id]
-
+            self.assertFalse(destination.with_name("asset.tif.part").exists())
 
 if __name__ == "__main__":
     unittest.main()

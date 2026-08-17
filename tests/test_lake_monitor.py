@@ -18,7 +18,7 @@ class LakeMonitorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             lake = EarthLake(directory)
             run_id = lake.start_run({"catalog": "nasa", "interface": "test"})
-            asset_path = lake.source_item_directory("nasa", "HLSL30_V2.0", "granule-1") / "scene.B04.tif"
+            asset_path = lake.source_item_directory("nasa", "HLSL30_V2.0", "granule-1") / "scene.B04.bin"
             asset_path.parent.mkdir(parents=True)
             asset_path.write_bytes(b"sample-raster")
             item = {
@@ -42,12 +42,12 @@ class LakeMonitorTests(unittest.TestCase):
                 catalog="nasa",
                 item=item,
                 asset_key="B04",
-                source_url="https://example/scene.B04.tif",
+                source_url="https://example/scene.B04.bin",
                 local_path=asset_path,
                 status="downloaded",
             )
             lake.finish_run(run_id, "completed", [asset_id])
-            (asset_path.parent / "._scene.B04.tif").write_bytes(b"macOS metadata")
+            (asset_path.parent / "._scene.B04.bin").write_bytes(b"macOS metadata")
             (asset_path.parent / ".DS_Store").write_bytes(b"macOS metadata")
 
             monitor = LakeMonitor(directory)
@@ -66,7 +66,7 @@ class LakeMonitorTests(unittest.TestCase):
 
             asset = monitor.asset(asset_id)
             self.assertEqual(asset["bbox"], [-101.0, 39.0, -99.0, 41.0])
-            self.assertEqual(asset["local_path"], "source/nasa/HLSL30_V2.0/granule-1/scene.B04.tif")
+            self.assertEqual(asset["local_path"], "source/nasa/HLSL30_V2.0/granule-1/scene.B04.bin")
             spatial = monitor.spatial_assets()
             self.assertEqual(spatial["type"], "FeatureCollection")
             self.assertEqual(spatial["features"][0]["properties"]["asset_id"], asset_id)

@@ -1,34 +1,26 @@
 import json
 import logging
 import os
+import threading
 import time
-import uuid
 from datetime import date, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import requests
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pystac_client import Client
 from shapely.wkt import loads as load_wkt
 
-from earth_lake import EarthLake
 from lake_monitor import LAKE_LAYERS, LakeMonitor
 from lake_preview import PreviewError, render_preview
 from stac_core import (
     REQUEST_TIMEOUT,
     STAC_CATALOGS,
-    asset_filename,
-    download_asset,
-    get_collection_metadata,
-    get_asset_size,
     http_session,
-    resolve_asset_url,
-    search_items,
-    selected_assets,
 )
 from acquisition import AcquisitionManager, AcquisitionRequest
 
@@ -46,7 +38,14 @@ DOWNLOAD_DIR = Path(os.environ.get("EARTH_LAKE_ROOT", str(DEFAULT_DOWNLOAD_DIR))
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 FRONTEND_DIR = Path(__file__).parent / "frontend"
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
-TASKS: dict[str, dict[str, Any]] = {}
+TASK_LIST_CACHE_TTL_SECONDS = 5.0
+TASK_LIST_CACHE: dict[str, Any] = {"expires_at": 0.0, "items": []}
+TASK_LIST_CACHE_LOCK = threading.Lock()
+
+
+def invalidate_task_list_cache() -> None:
+    with TASK_LIST_CACHE_LOCK:
+        TASK_LIST_CACHE.update(expires_at=0.0, items=[])
 
 
 class SearchRequest(BaseModel):
@@ -56,6 +55,10 @@ class SearchRequest(BaseModel):
     end_date: date = Field(..., description="End date (YYYY-MM-DD)")
     catalog: Literal["microsoft", "earth-search", "nasa"] = "microsoft"
     max_items: int | None = Field(None, ge=1, description="Optional total item limit; omit to follow all pages")
+    asset_keys: list[str] | None = Field(
+        None,
+        description="Optional explicit STAC Asset keys; omit for provider-aware main/all selection",
+    )
 
     @field_validator("wkt")
     @classmethod
@@ -74,6 +77,16 @@ class SearchRequest(BaseModel):
         cleaned = [value.strip() for value in values if value.strip()]
         if not cleaned:
             raise ValueError("At least one collection is required")
+        return cleaned
+
+    @field_validator("asset_keys")
+    @classmethod
+    def validate_asset_keys(cls, values: list[str] | None) -> list[str] | None:
+        if values is None:
+            return None
+        cleaned = list(dict.fromkeys(value.strip() for value in values if value.strip()))
+        if not cleaned:
+            raise ValueError("asset_keys must contain at least one non-empty key")
         return cleaned
 
     @model_validator(mode="after")
@@ -119,6 +132,8 @@ class TaskStatus(BaseModel):
     downloaded_bytes: int = 0
     total_files: int = 0
     completed_files: int = 0
+    failed_files: int = 0
+    planning_errors: int = 0
     current_file: str | None = None
     results: list[str] = Field(default_factory=list)
     skipped: list[str] = Field(default_factory=list)
@@ -128,14 +143,17 @@ class TaskStatus(BaseModel):
 
 
 def acquisition_manager() -> AcquisitionManager:
-    return AcquisitionManager(DOWNLOAD_DIR)
+    manager = getattr(app.state, "acquisition_manager", None)
+    if manager is None:
+        manager = AcquisitionManager(DOWNLOAD_DIR)
+        app.state.acquisition_manager = manager
+    return manager
 
 
 @app.on_event("startup")
 def start_acquisition_scheduler() -> None:
     manager = acquisition_manager()
     manager.start_scheduler()
-    app.state.acquisition_manager = manager
     monitor = LakeMonitor(DOWNLOAD_DIR)
     monitor.warm_registry()
     app.state.lake_monitor = monitor
@@ -213,145 +231,6 @@ def discover_stac_collections(catalog: str, aoi_wkt: str) -> list[CollectionInfo
         except (IndexError, TypeError, AttributeError):
             logger.warning("Skipping malformed collection metadata: %s", collection.id)
     return results
-
-
-def download_worker(
-    task_id: str,
-    catalog: str,
-    items: list[dict[str, Any]],
-    only_main: bool,
-    lake: EarthLake | None = None,
-    run_id: str | None = None,
-    collection_metadata_by_id: dict[str, dict[str, Any]] | None = None,
-) -> list[str]:
-    task = TASKS[task_id]
-    task.update(status="downloading", message="Preparing download queue...", total_bytes=0, downloaded_bytes=0)
-    lake = lake or EarthLake(DOWNLOAD_DIR)
-    owns_run = run_id is None
-    run_id = run_id or lake.start_run(
-        {"interface": "api", "catalog": catalog, "only_main": only_main, "item_count": len(items)}
-    )
-    task.update(run_id=run_id, protocol_root=str(lake.root))
-    session = http_session()
-    jobs: list[dict[str, Any]] = []
-    output_asset_ids: list[str] = []
-    collection_metadata_by_id = collection_metadata_by_id or {}
-
-    for item in items:
-        assets = list(selected_assets(item, only_main))
-        if not assets:
-            task["failures"].append(f"{item.get('id', 'unknown')}: no matching downloadable assets")
-            continue
-        for key, asset in assets:
-            url = resolve_asset_url(asset, catalog)
-            if not url:
-                task["failures"].append(f"{item.get('id', 'unknown')}/{key}: missing asset URL")
-                continue
-            try:
-                directory = lake.source_item_directory(catalog, item.get("collection"), item.get("id"))
-                filename = asset_filename(key, asset)
-            except ValueError as exc:
-                task["failures"].append(f"{item.get('id', 'unknown')}/{key}: {exc}")
-                continue
-            size = get_asset_size(session, url)
-            task["total_bytes"] += size
-            jobs.append(
-                {
-                    "url": url,
-                    "directory": directory,
-                    "filename": filename,
-                    "item": item,
-                    "asset_key": key,
-                    "source_url": asset.get("href", ""),
-                    "expected_size": size,
-                }
-            )
-
-    if not jobs:
-        task.update(status="failed", progress=0.0, message="No downloadable assets found.")
-        if owns_run:
-            lake.finish_run(run_id, "failed", [])
-        return []
-
-    task.update(
-        message=f"Downloading {len(jobs)} assets...",
-        total_files=len(jobs),
-        completed_files=0,
-        current_file=None,
-    )
-    for job in jobs:
-        destination = job["directory"] / job["filename"]
-        task["current_file"] = job["filename"]
-        try:
-            job["directory"].mkdir(parents=True, exist_ok=True)
-            metadata_path = job["directory"] / "metadata.json"
-            if not metadata_path.exists():
-                metadata_path.write_text(json.dumps(job["item"], indent=2), encoding="utf-8")
-
-            if destination.exists():
-                actual_size = destination.stat().st_size
-                expected_size = job["expected_size"]
-                if expected_size and actual_size != expected_size:
-                    task["failures"].append(
-                        f"{destination}: existing file size {actual_size} does not match expected {expected_size}"
-                    )
-                    continue
-                task["downloaded_bytes"] += actual_size
-                task["skipped"].append(str(destination))
-                output_asset_ids.append(
-                    lake.record_asset(
-                        run_id=run_id,
-                        catalog=catalog,
-                        item=job["item"],
-                        asset_key=job["asset_key"],
-                        source_url=job["source_url"],
-                        local_path=destination,
-                        status="skipped",
-                        collection_metadata=collection_metadata_by_id.get(job["item"].get("collection")),
-                    )
-                )
-                continue
-
-            logger.info("Task %s: downloading %s", task_id, job["url"])
-
-            def on_chunk(size: int) -> None:
-                task["downloaded_bytes"] += size
-                if task["total_bytes"]:
-                    task["progress"] = min(99.9, task["downloaded_bytes"] / task["total_bytes"] * 100)
-
-            download_asset(session, job["url"], destination, on_chunk)
-            output_asset_ids.append(
-                lake.record_asset(
-                    run_id=run_id,
-                    catalog=catalog,
-                    item=job["item"],
-                    asset_key=job["asset_key"],
-                    source_url=job["source_url"],
-                    local_path=destination,
-                    status="downloaded",
-                    collection_metadata=collection_metadata_by_id.get(job["item"].get("collection")),
-                )
-            )
-            task["results"].append(str(destination))
-        except Exception as exc:
-            logger.exception("Task %s: failed to download %s", task_id, job["url"])
-            task["failures"].append(f"{destination}: {exc}")
-        finally:
-            task["completed_files"] += 1
-            if not task["total_bytes"]:
-                task["progress"] = task["completed_files"] / task["total_files"] * 100
-
-    completed = len(task["results"]) + len(task["skipped"])
-    task["current_file"] = None
-    if task["failures"] and completed:
-        task.update(status="partial", progress=100.0, message=f"Downloaded {completed} assets with {len(task['failures'])} failures.")
-    elif task["failures"]:
-        task.update(status="failed", message=f"All downloads failed ({len(task['failures'])} failures).")
-    else:
-        task.update(status="completed", progress=100.0, message=f"Downloaded {completed} assets.")
-    if owns_run:
-        lake.finish_run(run_id, task["status"], output_asset_ids)
-    return output_asset_ids
 
 
 @app.get("/health")
@@ -513,105 +392,38 @@ def discover_collections(req: DiscoveryRequest) -> list[CollectionInfo]:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-def workflow_worker(task_id: str, req: SearchRequest, only_main: bool) -> None:
-    task = TASKS[task_id]
-    task.update(status="searching", start_time=time.time(), message=f"Searching {req.catalog}...")
-    lake: EarthLake | None = None
-    run_id: str | None = None
-    output_asset_ids: list[str] = []
-    collection_metadata_by_id: dict[str, dict[str, Any]] = {}
-    try:
-        lake = EarthLake(DOWNLOAD_DIR)
-        run_id = lake.start_run(
-            {
-                "interface": "api",
-                "catalog": req.catalog,
-                "collections": req.collections,
-                "wkt": req.wkt,
-                "start_date": req.start_date.isoformat(),
-                "end_date": req.end_date.isoformat(),
-                "max_items": req.max_items,
-                "only_main": only_main,
-            }
-        )
-        task.update(run_id=run_id, protocol_root=str(lake.root))
-        items = search_items(
-            req.catalog,
-            req.wkt,
-            req.collections,
-            req.start_date.isoformat(),
-            req.end_date.isoformat(),
-            req.max_items,
-        )
-        if not items:
-            task.update(status="completed", progress=100.0, message="No items found in search area/time.")
-            return
-        for collection in {str(item.get("collection")) for item in items if item.get("collection")}:
-            try:
-                collection_metadata_by_id[collection] = get_collection_metadata(req.catalog, collection)
-            except Exception:
-                logger.warning("Could not fetch collection metadata for %s", collection, exc_info=True)
-        task["message"] = f"Found {len(items)} items. Starting download..."
-        output_asset_ids = download_worker(
-            task_id,
-            req.catalog,
-            items,
-            only_main,
-            lake,
-            run_id,
-            collection_metadata_by_id,
-        )
-    except Exception as exc:
-        logger.exception("Task %s failed", task_id)
-        task.update(status="failed", message=f"Error: {exc}")
-    finally:
-        task["elapsed_time"] = round(time.time() - task["start_time"], 2)
-        if lake and run_id:
-            try:
-                lake.finish_run(run_id, task["status"], output_asset_ids)
-            except Exception as exc:
-                logger.exception("Task %s failed to finalize protocol registry", task_id)
-                task.update(status="failed", message=f"Protocol finalization failed: {exc}")
-
-
 @app.post("/stac/search_and_download", response_model=dict[str, str], status_code=202)
 def search_and_download(
     req: SearchRequest,
-    background_tasks: BackgroundTasks,
     only_main: bool = Query(True, description="Download representative assets only"),
-    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
 ) -> dict[str, str]:
     manager = acquisition_manager()
     request = AcquisitionRequest(
         catalog=req.catalog, collections=req.collections, wkt=req.wkt,
         start_date=req.start_date.isoformat(), end_date=req.end_date.isoformat(),
-        max_items=req.max_items, only_main=only_main,
+        max_items=req.max_items, only_main=only_main, asset_keys=req.asset_keys,
     )
-    task_id = manager.create_run(request, idempotency_key or str(uuid.uuid4()))
+    task_id = manager.create_run(request, idempotency_key)
+    invalidate_task_list_cache()
     return {"task_id": task_id, "run_id": task_id, "message": "Acquisition queued. Use /acquisitions/{run_id} to track progress."}
 
 
 @app.get("/stac/tasks", response_model=list[TaskStatus])
 def list_tasks() -> list[TaskStatus]:
-    persisted = [_run_task(run) for run in acquisition_manager().list_runs(limit=200)["items"]]
-    legacy = [
-        task_status(task_id, data)
-        for task_id, data in sorted(
-            TASKS.items(),
-            key=lambda item: item[1].get("start_time", 0),
-            reverse=True,
-        )
-    ]
-    persisted_ids = {task.task_id for task in persisted}
-    return persisted + [task for task in legacy if task.task_id not in persisted_ids]
+    # Acquisition completion is reconciled against the Processing registry on
+    # every manager.list_runs() call. Do not serve a stale terminal snapshot.
+    now = time.monotonic()
+    items = [_run_task(run) for run in acquisition_manager().list_runs(limit=200)["items"]]
+    with TASK_LIST_CACHE_LOCK:
+        TASK_LIST_CACHE.update(expires_at=now + TASK_LIST_CACHE_TTL_SECONDS, items=items)
+    return items
 
 
 @app.get("/stac/tasks/{task_id}", response_model=TaskStatus)
 def get_task_status(task_id: str) -> TaskStatus:
-    if task_id in TASKS:
-        return task_status(task_id, TASKS[task_id])
     try:
-        return _run_task(acquisition_manager().get_run(task_id))
+        return _run_task(acquisition_manager().reconcile_external_status(task_id))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Task not found") from exc
 
@@ -619,11 +431,22 @@ def get_task_status(task_id: str) -> TaskStatus:
 def _run_task(run: dict[str, Any]) -> TaskStatus:
     status = "searching" if run["status"] == "discovering" else run["status"]
     started = datetime.fromisoformat(run["started_at"]).timestamp() if run.get("started_at") else None
+    finished = datetime.fromisoformat(run["finished_at"]).timestamp() if run.get("finished_at") else time.time()
+    elapsed = max(0.0, finished - started) if started else None
+    speed = run["downloaded_bytes"] / elapsed if elapsed and run["downloaded_bytes"] else 0.0
+    remaining = (
+        max(0.0, (run["total_bytes"] - run["downloaded_bytes"]) / speed)
+        if speed and run["total_bytes"] > run["downloaded_bytes"]
+        else None
+    )
     return TaskStatus(
         task_id=run["run_id"], run_id=run["run_id"], status=status,
         progress=run["progress"], message=run["message"], start_time=started,
+        elapsed_time=elapsed, remaining_time=remaining,
         total_bytes=run["total_bytes"], downloaded_bytes=run["downloaded_bytes"],
         total_files=run["total_files"], completed_files=run["completed_files"],
+        failed_files=run["failed_files"],
+        planning_errors=run.get("planning_errors", 0),
         current_file=run["current_file"], failures=[run["error"]] if run.get("error") else [],
         protocol_root=str(Path(DOWNLOAD_DIR).resolve()),
     )
@@ -632,11 +455,10 @@ def _run_task(run: dict[str, Any]) -> TaskStatus:
 @app.post("/acquisitions", status_code=202)
 def create_acquisition(
     req: SearchRequest,
-    background_tasks: BackgroundTasks,
     only_main: bool = Query(True),
     idempotency_key: str = Header(..., alias="Idempotency-Key"),
 ) -> dict[str, Any]:
-    return search_and_download(req, background_tasks, only_main, idempotency_key)
+    return search_and_download(req, only_main, idempotency_key)
 
 
 @app.get("/acquisitions")
@@ -647,7 +469,7 @@ def list_acquisitions(cursor: str | None = None, limit: Annotated[int, Query(ge=
 @app.get("/acquisitions/{run_id}")
 def get_acquisition(run_id: str) -> dict[str, Any]:
     try:
-        run = acquisition_manager().get_run(run_id)
+        run = acquisition_manager().reconcile_external_status(run_id)
         run["batches"] = acquisition_manager().list_batches(run_id)
         return run
     except KeyError as exc:
@@ -657,7 +479,9 @@ def get_acquisition(run_id: str) -> dict[str, Any]:
 def _control_run(run_id: str, action: str) -> dict[str, Any]:
     manager = acquisition_manager()
     try:
-        return getattr(manager, f"{action}_run")(run_id)
+        run = getattr(manager, f"{action}_run")(run_id)
+        invalidate_task_list_cache()
+        return run
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Acquisition Run not found") from exc
     except ValueError as exc:
@@ -670,9 +494,8 @@ def pause_acquisition(run_id: str) -> dict[str, Any]:
 
 
 @app.post("/acquisitions/{run_id}/resume")
-def resume_acquisition(run_id: str, background_tasks: BackgroundTasks) -> dict[str, Any]:
-    run = _control_run(run_id, "resume")
-    return run
+def resume_acquisition(run_id: str) -> dict[str, Any]:
+    return _control_run(run_id, "resume")
 
 
 @app.post("/acquisitions/{run_id}/cancel")
@@ -684,7 +507,9 @@ def cancel_acquisition(run_id: str) -> dict[str, Any]:
 def retry_acquisition(run_id: str) -> dict[str, Any]:
     manager = acquisition_manager()
     try:
-        return manager.retry_failed(run_id)
+        run = manager.retry_failed(run_id)
+        invalidate_task_list_cache()
+        return run
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Acquisition Run not found") from exc
     except ValueError as exc:

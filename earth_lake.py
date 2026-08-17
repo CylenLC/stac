@@ -18,6 +18,11 @@ import rasterio
 from rasterio.errors import RasterioError
 from pystac.utils import str_to_datetime
 
+from protocol_commit import ProtocolCommit
+from stac_core import classify_asset
+from stac_identity import AssetIdentity, collection_identity, safe_component
+from stac_integrity import IntegrityError, IntegrityGate, IntegrityResult
+
 PROTOCOL_NAME = "EarthZarrProtocol"
 PROTOCOL_VERSION = "0.1.0"
 PROCESSING_VERSION = "2026.07.1"
@@ -114,6 +119,8 @@ REGISTRY_SCHEMAS: dict[str, pa.Schema] = {
     "assets": pa.schema(
         [
             ("asset_id", pa.string()),
+            ("catalog", pa.string()),
+            ("collection_id", pa.string()),
             ("product_id", pa.string()),
             ("grid_id", pa.string()),
             ("source_item_id", pa.string()),
@@ -123,6 +130,13 @@ REGISTRY_SCHEMAS: dict[str, pa.Schema] = {
             ("media_type", pa.string()),
             ("byte_size", pa.int64()),
             ("checksum_sha256", pa.string()),
+            ("expected_size", pa.int64()),
+            ("source_checksum", pa.string()),
+            ("source_checksum_algorithm", pa.string()),
+            ("checksum_verified", pa.bool_()),
+            ("integrity_status", pa.string()),
+            ("integrity_checks_json", pa.string()),
+            ("integrity_reason", pa.string()),
             ("datetime", pa.string()),
             ("bbox_json", pa.string()),
             ("geometry_json", pa.string()),
@@ -270,12 +284,6 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def safe_component(value: object, fallback: str = "unknown") -> str:
-    value = str(value or fallback).replace("\\", "/")
-    name = Path(value).name
-    return fallback if name in {"", ".", ".."} else name[:120]
-
-
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as file:
@@ -371,6 +379,7 @@ def optional_float(value: Any) -> float | None:
 
 class EarthLake:
     _lock = threading.RLock()
+    _recovered_roots: set[Path] = set()
 
     def __init__(self, root: str | Path):
         self.root = Path(root).resolve()
@@ -378,7 +387,15 @@ class EarthLake:
         self.registry_dir = self.root / "registry"
         self.stac_dir = self.root / "catalog" / "stac"
         self.source_dir = self.root / "source"
+        self._active_commit: ProtocolCommit | None = None
+        self._recover_protocol_commits()
         self.initialize()
+
+    def _recover_protocol_commits(self) -> None:
+        with self._lock:
+            if self.root not in self._recovered_roots:
+                ProtocolCommit.recover(self.root)
+                self._recovered_roots.add(self.root)
 
     def initialize(self) -> None:
         directories = [
@@ -448,7 +465,12 @@ class EarthLake:
             },
         )
         for name, schema in REGISTRY_SCHEMAS.items():
-            self._ensure_registry_schema(name, schema)
+            self._ensure_registry_schema(
+                name,
+                schema,
+                create_if_missing=name != "processing_runs",
+            )
+        self._migrate_asset_registry_identity()
         catalog_path = self.stac_dir / "catalog.json"
         if not catalog_path.exists():
             pystac.Catalog(
@@ -470,40 +492,138 @@ class EarthLake:
 
     def start_run(self, parameters: dict[str, Any], run_id: str | None = None) -> str:
         run_id = run_id or f"run-{uuid.uuid4()}"
-        if self._find("processing_runs", run_id):
+        existing = self.processing_run(run_id)
+        if existing:
+            self._validate_acquisition_processing_association_for_id(existing, run_id)
             return run_id
-        self._upsert(
-            "processing_runs",
-            {
-                "run_id": run_id,
-                "code_commit": self._code_commit(),
-                "container_image": os.environ.get("CONTAINER_IMAGE", ""),
-                "input_asset_ids": "[]",
-                "output_asset_ids": "[]",
-                "parameters_json": json.dumps(parameters, sort_keys=True),
-                "start_time": utc_now(),
-                "end_time": None,
-                "status": "running",
-                "checksum": None,
-            },
-        )
+        row = {
+            "run_id": run_id,
+            "code_commit": self._code_commit(),
+            "container_image": os.environ.get("CONTAINER_IMAGE", ""),
+            "input_asset_ids": "[]",
+            "output_asset_ids": "[]",
+            "parameters_json": json.dumps(parameters, sort_keys=True),
+            "start_time": utc_now(),
+            "end_time": None,
+            "status": "running",
+            "checksum": None,
+        }
+        self._validate_acquisition_processing_association_for_id(row, run_id)
+        self._commit_processing_row(row, kind="processing_run_start")
         return run_id
 
     def output_asset_ids(self, run_id: str) -> list[str]:
-        return [str(row["asset_id"]) for row in self._read_rows("assets") if row.get("run_id") == run_id]
+        return sorted({str(row["asset_id"]) for row in self._read_rows("assets") if row.get("run_id") == run_id})
+
+    def processing_run(self, run_id: str) -> dict[str, Any] | None:
+        """Return the unique processing record or fail on duplicate identity."""
+
+        rows = [row for row in self._read_rows("processing_runs") if row.get("run_id") == run_id]
+        if len(rows) > 1:
+            raise ValueError(f"processing registry contains duplicate run identity: {run_id}")
+        return rows[0] if rows else None
+
+    @staticmethod
+    def _acquisition_run_id_for_processing_id(run_id: str) -> str | None:
+        if run_id.startswith("acq-") and len(run_id) > len("acq-"):
+            return run_id.removeprefix("acq-")
+        return None
+
+    def _validate_acquisition_processing_association_for_id(
+        self,
+        row: dict[str, Any],
+        processing_run_id: str,
+    ) -> None:
+        acquisition_run_id = self._acquisition_run_id_for_processing_id(processing_run_id)
+        if acquisition_run_id is None:
+            return
+        if str(row.get("run_id") or "") != processing_run_id:
+            raise ValueError(
+                f"processing run identity mismatch: expected {processing_run_id}, "
+                f"found {row.get('run_id')!r}"
+            )
+        raw_parameters = row.get("parameters_json")
+        try:
+            parameters = json.loads(raw_parameters) if isinstance(raw_parameters, str) else None
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"processing run {processing_run_id} has malformed parameters_json"
+            ) from exc
+        if not isinstance(parameters, dict) or parameters.get("acquisition_run_id") != acquisition_run_id:
+            raise ValueError(
+                f"processing run {processing_run_id} is not associated with acquisition "
+                f"run {acquisition_run_id}"
+            )
 
     def finish_run(self, run_id: str, status: str, output_asset_ids: list[str]) -> None:
-        row = self._find("processing_runs", run_id)
+        row = self.processing_run(run_id)
         if not row:
             raise KeyError(f"Unknown processing run: {run_id}")
-        outputs = sorted(set(output_asset_ids))
+        self._validate_acquisition_processing_association_for_id(row, run_id)
+        outputs = sorted({str(asset_id) for asset_id in output_asset_ids})
         row.update(
             output_asset_ids=json.dumps(outputs),
             end_time=utc_now(),
             status=status,
             checksum=hashlib.sha256("\n".join(outputs).encode()).hexdigest(),
         )
-        self._upsert("processing_runs", row)
+        self._commit_processing_row(row, kind="processing_run_finish")
+
+    def reconcile_processing_run(
+        self,
+        run_id: str,
+        status: str,
+        output_asset_ids: list[str],
+        *,
+        parameters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Rebuild or converge processing provenance without touching Assets."""
+
+        row = self.processing_run(run_id)
+        if row is None:
+            self.start_run(
+                parameters or {"interface": "acquisition", "acquisition_run_id": run_id.removeprefix("acq-")},
+                run_id=run_id,
+            )
+        else:
+            self._validate_acquisition_processing_association_for_id(row, run_id)
+        self.finish_run(run_id, status, output_asset_ids)
+        row = self.processing_run(run_id)
+        if row is None:
+            raise RuntimeError(f"processing finalization did not publish run {run_id}")
+
+        expected_outputs = sorted({str(asset_id) for asset_id in output_asset_ids})
+        try:
+            recorded_outputs = sorted({str(asset_id) for asset_id in json.loads(row.get("output_asset_ids") or "[]")})
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"processing run {run_id} has invalid output_asset_ids") from exc
+        expected_checksum = hashlib.sha256("\n".join(expected_outputs).encode()).hexdigest()
+        if (
+            row.get("status") != status
+            or recorded_outputs != expected_outputs
+            or row.get("checksum") != expected_checksum
+        ):
+            raise RuntimeError(f"processing finalization verification failed for run {run_id}")
+        return row
+
+    def _commit_processing_row(self, row: dict[str, Any], *, kind: str) -> None:
+        """Publish one processing registry update through the lake protocol."""
+
+        self._validate_acquisition_processing_association_for_id(row, str(row.get("run_id") or ""))
+        self._recover_protocol_commits()
+        metadata = {"run_id": str(row["run_id"]), "status": str(row.get("status") or "")}
+        try:
+            with self._lock, ProtocolCommit(self.root, kind=kind, metadata=metadata) as commit:
+                previous_commit = self._active_commit
+                self._active_commit = commit
+                try:
+                    self._upsert("processing_runs", row)
+                finally:
+                    self._active_commit = previous_commit
+        except Exception:
+            with self._lock:
+                self._recovered_roots.discard(self.root)
+            raise
 
     def reindex_source_assets(
         self,
@@ -562,23 +682,129 @@ class EarthLake:
         local_path: str | Path,
         status: str,
         collection_metadata: dict[str, Any] | None = None,
+        integrity: IntegrityResult | dict[str, Any] | None = None,
+        asset_category: str | None = None,
+    ) -> str:
+        self._recover_protocol_commits()
+        metadata = {
+            "run_id": run_id,
+            "catalog": catalog,
+            "collection": str(item.get("collection") or "unknown"),
+            "source_item_id": str(item.get("id") or "unknown"),
+            "asset_key": asset_key,
+        }
+        try:
+            with self._lock, ProtocolCommit(self.root, kind="record_asset", metadata=metadata) as commit:
+                commit.prepare_tree(self.stac_dir)
+                self._active_commit = commit
+                try:
+                    return self._record_asset(
+                        run_id=run_id,
+                        catalog=catalog,
+                        item=item,
+                        asset_key=asset_key,
+                        source_url=source_url,
+                        local_path=local_path,
+                        status=status,
+                        collection_metadata=collection_metadata,
+                        integrity=integrity,
+                        asset_category=asset_category,
+                    )
+                finally:
+                    self._active_commit = None
+        except Exception:
+            with self._lock:
+                self._recovered_roots.discard(self.root)
+            raise
+
+    def _record_asset(
+        self,
+        *,
+        run_id: str,
+        catalog: str,
+        item: dict[str, Any],
+        asset_key: str,
+        source_url: str,
+        local_path: str | Path,
+        status: str,
+        collection_metadata: dict[str, Any] | None = None,
+        integrity: IntegrityResult | dict[str, Any] | None = None,
+        asset_category: str | None = None,
     ) -> str:
         path = Path(local_path).resolve()
         if not path.is_file():
             raise FileNotFoundError(path)
+        source_asset = (item.get("assets") or {}).get(asset_key)
+        source_asset = source_asset if isinstance(source_asset, dict) else None
+        asset_category = asset_category or classify_asset(asset_key, source_asset or {})
+        if integrity is not None:
+            integrity_data = integrity.to_dict() if isinstance(integrity, IntegrityResult) else dict(integrity)
+            if not integrity_data.get("ok"):
+                raise IntegrityError(
+                    IntegrityResult(
+                        ok=False,
+                        checks=integrity_data.get("checks") or {},
+                        expected_size=integrity_data.get("expected_size"),
+                        actual_size=int(integrity_data.get("actual_size") or 0),
+                        source_checksum=integrity_data.get("source_checksum"),
+                        source_checksum_algorithm=integrity_data.get("source_checksum_algorithm"),
+                        local_sha256=integrity_data.get("local_sha256"),
+                        checksum_verified=integrity_data.get("checksum_verified"),
+                        detected_type=integrity_data.get("detected_type"),
+                        response_status=integrity_data.get("response_status"),
+                        response_content_type=integrity_data.get("response_content_type"),
+                        reason_code=integrity_data.get("reason_code"),
+                        reason=integrity_data.get("reason"),
+                        validated_path=integrity_data.get("validated_path"),
+                        validated_size=integrity_data.get("validated_size"),
+                        validated_mtime_ns=integrity_data.get("validated_mtime_ns"),
+                        validated_sha256=integrity_data.get("validated_sha256"),
+                    )
+                )
+            stat = path.stat()
+            bound_path = integrity_data.get("validated_path")
+            bound_size = integrity_data.get("validated_size")
+            bound_mtime = integrity_data.get("validated_mtime_ns")
+            bound_sha256 = integrity_data.get("validated_sha256") or integrity_data.get("local_sha256")
+            current_sha256 = sha256_file(path) if isinstance(bound_sha256, str) else None
+            if (
+                bound_path != str(path)
+                or bound_size != stat.st_size
+                or bound_mtime != stat.st_mtime_ns
+                or not isinstance(bound_sha256, str)
+                or current_sha256 != bound_sha256
+            ):
+                # A passing result is reusable only for the exact published
+                # file it validated. Re-run the gate when callers provide an
+                # unbound or stale result instead of trusting its boolean.
+                validation_asset = source_asset or {"href": source_url or path.name}
+                rebound = IntegrityGate.validate(path, validation_asset)
+                if not rebound.ok:
+                    raise IntegrityError(rebound)
+                integrity_data = rebound.to_dict()
+        else:
+            # Keep direct/reindex callers behind the same publication gate as
+            # the acquisition manager.  Metadata unavailable to a legacy
+            # caller is intentionally treated as optional, but the local file
+            # must still be non-empty and structurally valid when its suffix
+            # identifies a raster or JSON document.
+            inferred_asset = {"href": source_url or path.name}
+            integrity_result = IntegrityGate.validate(path, inferred_asset)
+            if not integrity_result.ok:
+                raise IntegrityError(integrity_result)
+            integrity_data = integrity_result.to_dict()
         try:
             relative_path = path.relative_to(self.root).as_posix()
         except ValueError as exc:
             raise ValueError("Registered assets must be inside the Earth Lake root") from exc
 
         now = utc_now()
-        collection = str(item.get("collection") or "unknown")
-        item_id = str(item.get("id") or "unknown")
+        identity = AssetIdentity.from_item(catalog, item, asset_key)
+        collection = identity.collection
+        item_id = identity.item_id
         source_id = catalog
-        product_id = safe_component(collection).lower()
-        asset_id = hashlib.sha256(
-            f"{catalog}|{collection}|{item_id}|{asset_key}|{source_url}".encode()
-        ).hexdigest()
+        product_id = collection_identity(catalog, collection).lower()
+        asset_id = identity.digest()
         existing_asset = self._find("assets", asset_id)
         lineage_run_id = existing_asset.get("run_id") if existing_asset else run_id
         provider, endpoint, auth_type = SOURCE_INFO.get(catalog, (catalog, "", "unknown"))
@@ -631,11 +857,13 @@ class EarthLake:
         geometry = item.get("geometry")
         bbox = item.get("bbox")
         acquired = item.get("properties", {}).get("datetime")
-        checksum = sha256_file(path)
+        checksum = integrity_data.get("local_sha256") or sha256_file(path)
         self._upsert(
             "assets",
             {
                 "asset_id": asset_id,
+                "catalog": catalog,
+                "collection_id": collection,
                 "product_id": product_id,
                 "grid_id": grid_id,
                 "source_item_id": item_id,
@@ -645,6 +873,13 @@ class EarthLake:
                 "media_type": mimetypes.guess_type(path.name)[0] or "application/octet-stream",
                 "byte_size": path.stat().st_size,
                 "checksum_sha256": checksum,
+                "expected_size": integrity_data.get("expected_size"),
+                "source_checksum": integrity_data.get("source_checksum"),
+                "source_checksum_algorithm": integrity_data.get("source_checksum_algorithm"),
+                "checksum_verified": integrity_data.get("checksum_verified"),
+                "integrity_status": "passed" if integrity_data.get("ok") else "legacy_unverified",
+                "integrity_checks_json": json.dumps(integrity_data.get("checks") or {}, sort_keys=True),
+                "integrity_reason": integrity_data.get("reason"),
                 "datetime": acquired,
                 "bbox_json": json.dumps(bbox) if bbox is not None else None,
                 "geometry_json": json.dumps(geometry) if geometry is not None else None,
@@ -657,6 +892,7 @@ class EarthLake:
             preserve_created=True,
         )
         self._update_stac(
+            catalog=catalog,
             collection=collection,
             item_id=item_id,
             item=item,
@@ -664,10 +900,14 @@ class EarthLake:
             asset_id=asset_id,
             path=path,
             checksum=checksum,
+            integrity=integrity_data,
             grid_id=grid_id,
             version=version,
             run_id=lineage_run_id,
             collection_details=product_details,
+            asset_roles=(source_asset or {}).get("roles"),
+            asset_media_type=(source_asset or {}).get("type") or (source_asset or {}).get("media_type"),
+            asset_category=asset_category,
         )
         return asset_id
 
@@ -794,6 +1034,7 @@ class EarthLake:
     def _update_stac(
         self,
         *,
+        catalog: str,
         collection: str,
         item_id: str,
         item: dict[str, Any],
@@ -801,16 +1042,25 @@ class EarthLake:
         asset_id: str,
         path: Path,
         checksum: str,
+        integrity: dict[str, Any],
         grid_id: str,
         version: str,
         run_id: str,
         collection_details: dict[str, Any],
+        asset_roles: list[str] | None = None,
+        asset_media_type: str | None = None,
+        asset_category: str | None = None,
     ) -> None:
         with self._lock:
-            catalog = pystac.Catalog.from_file(str(self.stac_dir / "catalog.json"))
-            collection_id = safe_component(collection).lower()
+            stac_dir = (
+                self._active_commit.prepare_tree(self.stac_dir)
+                if self._active_commit
+                else self.stac_dir
+            )
+            stac_catalog = pystac.Catalog.from_file(str(stac_dir / "catalog.json"))
+            collection_id = collection_identity(catalog, collection).lower()
             stac_collection = next(
-                (value for value in catalog.get_collections() if value.id == collection_id), None
+                (value for value in stac_catalog.get_collections() if value.id == collection_id), None
             )
             if stac_collection is None:
                 stac_collection = pystac.Collection(
@@ -823,7 +1073,7 @@ class EarthLake:
                     license=collection_details.get("license") or "various",
                     title=collection_details.get("title"),
                 )
-                catalog.add_child(stac_collection)
+                stac_catalog.add_child(stac_collection)
             else:
                 stac_collection.description = collection_details.get("description") or stac_collection.description
                 stac_collection.title = collection_details.get("title") or stac_collection.title
@@ -845,20 +1095,41 @@ class EarthLake:
                     },
                 )
                 stac_collection.add_item(stac_item)
+            category_roles = {
+                "data": ["data"],
+                "auxiliary": ["auxiliary"],
+                "visual": ["visual"],
+                "thumbnail": ["thumbnail"],
+                "metadata": ["metadata"],
+            }
+            resolved_roles = (
+                list(asset_roles)
+                if asset_roles is not None
+                else category_roles.get(asset_category or "", [])
+            )
             stac_item.add_asset(
                 safe_component(asset_key, "data"),
                 pystac.Asset(
                     href=str(path),
-                    media_type=mimetypes.guess_type(path.name)[0] or "application/octet-stream",
-                    roles=["data"],
+                    media_type=asset_media_type or mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+                    roles=resolved_roles,
                     extra_fields={
                         "earthzarr:asset_id": asset_id,
                         "earthzarr:checksum_sha256": checksum,
                         "earthzarr:lineage_id": run_id,
+                        "earthzarr:integrity_status": "passed" if integrity.get("ok") else "failed",
+                        "earthzarr:integrity_checks": integrity.get("checks") or {},
+                        "earthzarr:checksum_verified": integrity.get("checksum_verified"),
+                        "earthzarr:resolved_category": asset_category,
                     },
                 ),
             )
-            catalog.normalize_and_save(str(self.stac_dir), catalog_type=pystac.CatalogType.SELF_CONTAINED)
+            stac_catalog.normalize_and_save(str(stac_dir), catalog_type=pystac.CatalogType.SELF_CONTAINED)
+
+    def registered_asset(self, asset_id: str) -> dict[str, Any] | None:
+        """Return one canonical Registry Asset for recovery checks."""
+
+        return self._find("assets", asset_id)
 
     def _find(self, table: str, key_value: str) -> dict[str, Any] | None:
         key = REGISTRY_KEYS[table]
@@ -880,17 +1151,136 @@ class EarthLake:
 
     def _read_rows(self, table: str) -> list[dict[str, Any]]:
         path = self.registry_dir / f"{table}.parquet"
+        if self._active_commit:
+            staged = self._active_commit.staged_path(path)
+            if staged.exists():
+                path = staged
         return pq.read_table(path).to_pylist() if path.exists() else []
 
-    def _ensure_registry_schema(self, table: str, schema: pa.Schema) -> None:
+    def _ensure_registry_schema(
+        self,
+        table: str,
+        schema: pa.Schema,
+        *,
+        create_if_missing: bool = True,
+    ) -> None:
         path = self.registry_dir / f"{table}.parquet"
         if not path.exists():
+            if not create_if_missing:
+                return
             self._write_table(path, [], schema)
             return
         current = pq.read_table(path)
         if current.schema.equals(schema, check_metadata=False):
             return
         self._write_table(path, current.to_pylist(), schema)
+
+    def _migrate_asset_registry_identity(self) -> None:
+        """Backfill canonical asset identity fields in older registries.
+
+        Existing rows are retained. A duplicate canonical identity is treated
+        as an ambiguity and stops initialization rather than merging records.
+        """
+
+        rows = self._read_rows("assets")
+        if not rows:
+            return
+        mapping: dict[str, str] = {}
+        seen: dict[str, dict[str, Any]] = {}
+        changed = False
+        for row in rows:
+            local_path = str(row.get("local_path") or "")
+            local_path_obj = Path(local_path)
+            if local_path_obj.is_absolute():
+                try:
+                    local_path = local_path_obj.resolve().relative_to(self.root).as_posix()
+                except ValueError:
+                    local_path = ""
+            parts = Path(local_path).parts
+            catalog = str(row.get("catalog") or "")
+            collection = str(row.get("collection_id") or "")
+            if parts and parts[0] == "source" and len(parts) >= 3:
+                catalog = catalog or parts[1]
+                collection = collection or parts[2]
+            if not catalog or not collection or not row.get("source_item_id") or not row.get("asset_key"):
+                raise ValueError(
+                    "registry contains legacy asset with ambiguous canonical identity; "
+                    f"asset_id={row.get('asset_id')!r}, local_path={row.get('local_path')!r}"
+                )
+            identity = AssetIdentity(
+                catalog,
+                collection,
+                str(row["source_item_id"]),
+                str(row["asset_key"]),
+            )
+            canonical_id = identity.digest()
+            previous = seen.get(canonical_id)
+            if previous:
+                raise ValueError(
+                    f"registry contains duplicate canonical asset identity {canonical_id}"
+                )
+            seen[canonical_id] = row
+            old_id = str(row.get("asset_id") or "")
+            if old_id and old_id != canonical_id:
+                mapping[old_id] = canonical_id
+                changed = True
+            if row.get("catalog") != catalog or row.get("collection_id") != collection:
+                changed = True
+            row["asset_id"] = canonical_id
+            row["catalog"] = catalog
+            row["collection_id"] = collection
+        if changed:
+            with ProtocolCommit(
+                self.root,
+                kind="registry_identity_migration",
+                metadata={"asset_count": len(rows)},
+            ) as commit:
+                previous_commit = self._active_commit
+                self._active_commit = commit
+                try:
+                    self._write_table(self.registry_dir / "assets.parquet", rows, REGISTRY_SCHEMAS["assets"])
+                    if mapping:
+                        processing_rows = self._read_rows("processing_runs")
+                        processing_changed = False
+                        for row in processing_rows:
+                            try:
+                                asset_ids = json.loads(row.get("output_asset_ids") or "[]")
+                            except json.JSONDecodeError:
+                                continue
+                            updated = [mapping.get(str(asset_id), str(asset_id)) for asset_id in asset_ids]
+                            if updated != asset_ids:
+                                row["output_asset_ids"] = json.dumps(updated)
+                                row["checksum"] = hashlib.sha256("\n".join(updated).encode()).hexdigest()
+                                processing_changed = True
+                        if processing_changed:
+                            self._write_table(
+                                self.registry_dir / "processing_runs.parquet",
+                                processing_rows,
+                                REGISTRY_SCHEMAS["processing_runs"],
+                            )
+                        self._migrate_stac_asset_ids(mapping)
+                finally:
+                    self._active_commit = previous_commit
+
+    def _migrate_stac_asset_ids(self, mapping: dict[str, str]) -> None:
+        stac_dir = (
+            self._active_commit.prepare_tree(self.stac_dir)
+            if self._active_commit
+            else self.stac_dir
+        )
+        catalog_path = stac_dir / "catalog.json"
+        if not catalog_path.exists():
+            return
+        catalog = pystac.Catalog.from_file(str(catalog_path))
+        changed = False
+        for item in catalog.get_all_items():
+            for asset in item.assets.values():
+                old_id = asset.extra_fields.get("earthzarr:asset_id")
+                if old_id in mapping:
+                    asset.extra_fields["earthzarr:asset_id"] = mapping[old_id]
+                    changed = True
+        if changed:
+            catalog.normalize_and_save(str(stac_dir), catalog_type=pystac.CatalogType.SELF_CONTAINED)
 
     @staticmethod
     def _read_item_metadata(path: Path) -> dict[str, Any] | None:
@@ -900,8 +1290,9 @@ class EarthLake:
             return None
         return value if isinstance(value, dict) else None
 
-    @staticmethod
-    def _write_table(path: Path, rows: list[dict[str, Any]], schema: pa.Schema) -> None:
+    def _write_table(self, path: Path, rows: list[dict[str, Any]], schema: pa.Schema) -> None:
+        if self._active_commit:
+            path = self._active_commit.staged_path(path)
         temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         pq.write_table(pa.Table.from_pylist(rows, schema=schema), temporary)
         os.replace(temporary, path)
