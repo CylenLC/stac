@@ -18,6 +18,114 @@ def now() -> str:
 
 class AcquisitionStore:
     IDENTITY_SCHEMA_VERSION = 3
+    SCHEMA_VERSION = IDENTITY_SCHEMA_VERSION
+    RUNTIME_SCHEMA = {
+        "acquisition_runs": {
+            "columns": {
+                "run_id": {"type": "TEXT", "not_null": False, "primary_key": 1},
+                "idempotency_key": {"type": "TEXT", "not_null": True},
+                "request_json": {"type": "TEXT", "not_null": True},
+                "status": {"type": "TEXT", "not_null": True},
+                "message": {"type": "TEXT", "not_null": True, "default": "''"},
+                "created_at": {"type": "TEXT", "not_null": True},
+                "updated_at": {"type": "TEXT", "not_null": True},
+                "started_at": {"type": "TEXT", "not_null": False},
+                "finished_at": {"type": "TEXT", "not_null": False},
+                "discovered_items": {"type": "INTEGER", "not_null": True, "default": "0"},
+                "total_files": {"type": "INTEGER", "not_null": True, "default": "0"},
+                "completed_files": {"type": "INTEGER", "not_null": True, "default": "0"},
+                "failed_files": {"type": "INTEGER", "not_null": True, "default": "0"},
+                "planning_errors": {"type": "INTEGER", "not_null": True, "default": "0"},
+                "total_bytes": {"type": "INTEGER", "not_null": True, "default": "0"},
+                "downloaded_bytes": {"type": "INTEGER", "not_null": True, "default": "0"},
+                "current_file": {"type": "TEXT", "not_null": False},
+                "error": {"type": "TEXT", "not_null": False},
+            },
+            "checks": (),
+            "unique_constraints": (("idempotency_key",),),
+        },
+        "search_pages": {
+            "columns": {
+                "run_id": {"type": "TEXT", "not_null": True, "primary_key": 1},
+                "page_number": {"type": "INTEGER", "not_null": True, "primary_key": 2},
+                "incoming_cursor": {"type": "TEXT", "not_null": False},
+                "outgoing_cursor": {"type": "TEXT", "not_null": False},
+                "item_count": {"type": "INTEGER", "not_null": True},
+                "manifest_path": {"type": "TEXT", "not_null": True},
+                "checksum_sha256": {"type": "TEXT", "not_null": True},
+                "created_at": {"type": "TEXT", "not_null": True},
+                "planned_at": {"type": "TEXT", "not_null": False},
+            },
+            "checks": (),
+            "foreign_keys": (("acquisition_runs", (("run_id", "run_id"),)),),
+        },
+        "discovered_items": {
+            "columns": {
+                "run_id": {"type": "TEXT", "not_null": True, "primary_key": 1},
+                "catalog": {"type": "TEXT", "not_null": True, "primary_key": 2},
+                "collection_id": {"type": "TEXT", "not_null": True, "primary_key": 3},
+                "source_item_id": {"type": "TEXT", "not_null": True, "primary_key": 4},
+                "page_number": {"type": "INTEGER", "not_null": True},
+                "item_json": {"type": "TEXT", "not_null": True},
+            },
+            "checks": (),
+            "foreign_keys": (("acquisition_runs", (("run_id", "run_id"),)),),
+        },
+        "download_batches": {
+            "columns": {
+                "run_id": {"type": "TEXT", "not_null": True, "primary_key": 1},
+                "batch_number": {"type": "INTEGER", "not_null": True, "primary_key": 2},
+                "status": {"type": "TEXT", "not_null": True},
+                "asset_count": {"type": "INTEGER", "not_null": True},
+                "completed_count": {"type": "INTEGER", "not_null": True, "default": "0"},
+                "failed_count": {"type": "INTEGER", "not_null": True, "default": "0"},
+                "created_at": {"type": "TEXT", "not_null": True},
+                "updated_at": {"type": "TEXT", "not_null": True},
+            },
+            "checks": (),
+            "foreign_keys": (("acquisition_runs", (("run_id", "run_id"),)),),
+        },
+        "download_attempts": {
+            "columns": {
+                "attempt_id": {"type": "TEXT", "not_null": False, "primary_key": 1},
+                "run_id": {"type": "TEXT", "not_null": True},
+                "batch_number": {"type": "INTEGER", "not_null": True},
+                "catalog": {"type": "TEXT", "not_null": True},
+                "collection_id": {"type": "TEXT", "not_null": True},
+                "source_item_id": {"type": "TEXT", "not_null": True},
+                "asset_key": {"type": "TEXT", "not_null": True},
+                "source_url": {"type": "TEXT", "not_null": True},
+                "destination": {"type": "TEXT", "not_null": True},
+                "status": {"type": "TEXT", "not_null": True},
+                "attempts": {"type": "INTEGER", "not_null": True, "default": "0"},
+                "expected_bytes": {"type": "INTEGER", "not_null": True, "default": "0"},
+                "downloaded_bytes": {"type": "INTEGER", "not_null": True, "default": "0"},
+                "etag": {"type": "TEXT", "not_null": False},
+                "error": {"type": "TEXT", "not_null": False},
+                "updated_at": {"type": "TEXT", "not_null": True},
+            },
+            "checks": (),
+            "unique_constraints": (
+                ("run_id", "catalog", "collection_id", "source_item_id", "asset_key"),
+            ),
+            "foreign_keys": (
+                ("download_batches", (("run_id", "run_id"), ("batch_number", "batch_number"))),
+            ),
+        },
+        "planning_errors": {
+            "columns": {
+                "run_id": {"type": "TEXT", "not_null": True, "primary_key": 1},
+                "catalog": {"type": "TEXT", "not_null": True, "primary_key": 2},
+                "collection_id": {"type": "TEXT", "not_null": True, "primary_key": 3},
+                "source_item_id": {"type": "TEXT", "not_null": True, "primary_key": 4},
+                "selector": {"type": "TEXT", "not_null": True, "primary_key": 5},
+                "message": {"type": "TEXT", "not_null": True},
+                "created_at": {"type": "TEXT", "not_null": True},
+            },
+            "checks": (),
+            "foreign_keys": (("acquisition_runs", (("run_id", "run_id"),)),),
+        },
+    }
     LEGACY_CATALOG = "__legacy__"
     LEGACY_COLLECTION = "__ambiguous__"
 
@@ -177,14 +285,19 @@ class AcquisitionStore:
 
     @staticmethod
     def _has_download_identity_unique(db: sqlite3.Connection) -> bool:
-        expected = {"run_id", "catalog", "collection_id", "source_item_id", "asset_key"}
+        expected = ("run_id", "catalog", "collection_id", "source_item_id", "asset_key")
         for index in db.execute("PRAGMA index_list(download_attempts)").fetchall():
             if not index["unique"]:
                 continue
-            columns = {
+            if "partial" in index.keys() and index["partial"]:
+                continue
+            columns = tuple(
                 str(row["name"])
-                for row in db.execute(f"PRAGMA index_info({index['name']})").fetchall()
-            }
+                for row in sorted(
+                    db.execute(f"PRAGMA index_info({index['name']})").fetchall(),
+                    key=lambda row: int(row["seqno"]),
+                )
+            )
             if columns == expected:
                 return True
         return False

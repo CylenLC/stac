@@ -1,11 +1,18 @@
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import rasterio
+import zarr
+from pyproj import CRS as PyprojCRS
 from rasterio.transform import from_origin
+from shapely.geometry import Point
 
 from earth_lake import EarthLake
 from lake_footprint import valid_data_footprint
@@ -87,11 +94,212 @@ class LakeMonitorTests(unittest.TestCase):
     def test_resources_do_not_escape_lake_root(self):
         with tempfile.TemporaryDirectory() as directory:
             lake = EarthLake(directory)
-            (Path(directory) / "entities" / "stations" / "stations.parquet").write_bytes(b"table")
+            entity = Path(directory) / "entities" / "stations" / "stations.parquet"
+            entity.write_bytes(b"table")
+            (entity.parent / ".stations.parquet.123.tmp").write_bytes(b"partial table")
+            manifest = Path(directory) / "manifests" / "materializations" / "hydrodatasets.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "records": [
+                            {
+                                "output": "entities/stations/stations.parquet",
+                                "dataset_id": "camels_test",
+                                "kind": "entity_stations",
+                                "row_count": 2,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
             resources = LakeMonitor(directory).resources("entities")
-            paths = {item["path"] for item in resources["items"]}
+            by_path = {item["path"]: item for item in resources["items"]}
+            paths = set(by_path)
             self.assertIn("entities/stations/stations.parquet", paths)
+            self.assertEqual(by_path["entities/stations/stations.parquet"]["materialization"]["dataset_id"], "camels_test")
             self.assertTrue(all(not path.startswith("/") for path in paths))
+
+    def test_resource_inventory_is_reused_within_cache_ttl(self):
+        with tempfile.TemporaryDirectory() as directory:
+            EarthLake(directory)
+            entity = Path(directory) / "entities" / "stations" / "stations.parquet"
+            entity.parent.mkdir(parents=True, exist_ok=True)
+            entity.write_bytes(b"table")
+            monitor = LakeMonitor(directory)
+
+            with patch("lake_monitor.os.walk", wraps=os.walk) as walk:
+                first = monitor.resources("entities")
+                calls_after_first_read = walk.call_count
+                second = monitor.resources("entities")
+
+            self.assertEqual(first, second)
+            self.assertGreater(calls_after_first_read, 0)
+            self.assertEqual(walk.call_count, calls_after_first_read)
+
+    def test_arrays_collapse_variable_groups_and_ignore_partial_stores(self):
+        with tempfile.TemporaryDirectory() as directory:
+            array_root = Path(directory) / "arrays" / "hydrology"
+            store = array_root / "daily.zarr"
+            (store / "flow").mkdir(parents=True)
+            (store / "zarr.json").write_text('{"zarr_format": 3, "node_type": "group"}', encoding="utf-8")
+            (store / "flow" / "zarr.json").write_text('{"zarr_format": 3, "node_type": "array"}', encoding="utf-8")
+            partial = array_root / ".daily.zarr.123.partial"
+            partial.mkdir(parents=True)
+            (partial / "zarr.json").write_text('{"zarr_format": 3, "node_type": "group"}', encoding="utf-8")
+
+            arrays = LakeMonitor(directory).arrays()
+            resources = LakeMonitor(directory).resources("arrays")
+
+            self.assertEqual([item["path"] for item in arrays], ["arrays/hydrology/daily.zarr"])
+            resource_paths = {item["path"] for item in resources["items"]}
+            self.assertIn("arrays/hydrology/daily.zarr", resource_paths)
+            self.assertNotIn("arrays/hydrology/daily.zarr/zarr.json", resource_paths)
+            self.assertTrue(all("partial" not in path for path in resource_paths))
+
+    def test_entity_and_array_details_are_compact_and_confined_to_lake(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entity = root / "entities" / "basins" / "basins.parquet"
+            entity.parent.mkdir(parents=True)
+            table = pa.table({"basin_id": ["001", "002"], "area_km2": [12.5, 34.0]})
+            table = table.replace_schema_metadata(
+                {b"earthzarr": b'{"entity_type":"basin"}', b"geo": b'{"version":"1.1.0"}'}
+            )
+            pq.write_table(table, entity)
+
+            store = root / "arrays" / "hydrology" / "daily.zarr"
+            store.mkdir(parents=True)
+            (store / "zarr.json").write_text(
+                json.dumps(
+                    {
+                        "zarr_format": 3,
+                        "node_type": "group",
+                        "attributes": {"title": "Daily flow"},
+                        "consolidated_metadata": {
+                            "metadata": {
+                                "flow": {
+                                    "node_type": "array",
+                                    "shape": [2, 3],
+                                    "data_type": "float32",
+                                    "dimension_names": ["time", "basin"],
+                                    "chunk_grid": {"configuration": {"chunk_shape": [1, 3]}},
+                                    "attributes": {"units": "m3/s"},
+                                }
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            monitor = LakeMonitor(directory)
+            entity_detail = monitor.resource_detail("entities/basins/basins.parquet")
+            array_detail = monitor.array_detail("arrays/hydrology/daily.zarr")
+
+            self.assertEqual(entity_detail["format"], "GeoParquet")
+            self.assertEqual(entity_detail["row_count"], 2)
+            self.assertEqual(entity_detail["schema"][0]["name"], "basin_id")
+            self.assertEqual(entity_detail["sample_rows"][1]["basin_id"], "002")
+            self.assertEqual(array_detail["zarr_format"], 3)
+            self.assertEqual(array_detail["variables"][0]["name"], "flow")
+            self.assertEqual(array_detail["variables"][0]["chunks"], [1, 3])
+            with self.assertRaises(KeyError):
+                monitor.resource_detail("../outside.parquet")
+
+    def test_entity_page_features_and_cached_zarr_slice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entity = root / "entities" / "basins" / "basins.geoparquet"
+            entity.parent.mkdir(parents=True)
+            table = pa.table({
+                "basin_id": ["001", "002", "003"],
+                "area_km2": [12.5, 34.0, 50.0],
+                "geometry": [Point(-100, 40).wkb, Point(-99, 41).wkb, Point(-98, 42).wkb],
+            })
+            table = table.replace_schema_metadata({
+                b"geo": json.dumps({
+                    "version": "1.1.0",
+                    "primary_column": "geometry",
+                    "columns": {"geometry": {"encoding": "WKB"}},
+                }).encode(),
+            })
+            pq.write_table(table, entity)
+            store = root / "arrays" / "hydrology" / "daily.zarr"
+            group = zarr.open_group(store, mode="w", zarr_format=3)
+            group.create_array("flow", data=np.arange(12, dtype="float32").reshape(3, 4))
+            zarr.consolidate_metadata(store, zarr_format=3)
+
+            monitor = LakeMonitor(directory)
+            page = monitor.entity_page(
+                "entities/basins/basins.geoparquet", offset=1, limit=1
+            )
+            features = monitor.entity_features(
+                "entities/basins/basins.geoparquet", limit=2
+            )
+            first_slice = monitor.array_slice(
+                "arrays/hydrology/daily.zarr", "flow", max_cells=6
+            )
+            second_slice = monitor.array_slice(
+                "arrays/hydrology/daily.zarr", "flow", max_cells=6
+            )
+
+            self.assertEqual(page["total"], 3)
+            self.assertEqual(page["items"][0]["basin_id"], "002")
+            self.assertNotIn("geometry", page["columns"])
+            self.assertEqual(len(features["features"]), 2)
+            self.assertEqual(features["features"][0]["geometry"]["type"], "Point")
+            self.assertEqual(first_slice["stats"]["min"], 0.0)
+            self.assertFalse(first_slice["cached"])
+            self.assertTrue(second_slice["cached"])
+
+    def test_projected_geoparquet_features_are_transformed_to_wgs84(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entity = root / "entities" / "stations" / "projected.geoparquet"
+            entity.parent.mkdir(parents=True)
+            table = pa.table({"station_id": ["001"], "geometry": [Point(500000, 0).wkb]})
+            table = table.replace_schema_metadata({
+                b"geo": json.dumps({
+                    "version": "1.1.0",
+                    "primary_column": "geometry",
+                    "columns": {
+                        "geometry": {
+                            "encoding": "WKB",
+                            "crs": PyprojCRS.from_epsg(32631).to_json_dict(),
+                        }
+                    },
+                }).encode(),
+            })
+            pq.write_table(table, entity)
+
+            features = LakeMonitor(directory).entity_features(
+                "entities/stations/projected.geoparquet"
+            )
+
+            longitude, latitude = features["features"][0]["geometry"]["coordinates"]
+            self.assertAlmostEqual(longitude, 3.0, places=5)
+            self.assertAlmostEqual(latitude, 0.0, places=5)
+
+    def test_array_detail_reads_zarr_v2_consolidated_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Path(directory) / "arrays" / "legacy.zarr"
+            store.mkdir(parents=True)
+            (store / ".zgroup").write_text('{"zarr_format":2}', encoding="utf-8")
+            (store / ".zmetadata").write_text(json.dumps({
+                "zarr_consolidated_format": 1,
+                "metadata": {
+                    "flow/.zarray": {"shape": [2, 3], "chunks": [1, 3], "dtype": "<f4"},
+                    "flow/.zattrs": {"_ARRAY_DIMENSIONS": ["time", "basin"], "units": "m3 s-1"},
+                },
+            }), encoding="utf-8")
+
+            detail = LakeMonitor(directory).array_detail("arrays/legacy.zarr")
+
+            self.assertEqual(detail["zarr_format"], 2)
+            self.assertEqual(detail["variables"][0]["name"], "flow")
+            self.assertEqual(detail["variables"][0]["chunks"], [1, 3])
 
     def test_geotiff_preview_is_cached_by_source_fingerprint(self):
         with tempfile.TemporaryDirectory() as directory:

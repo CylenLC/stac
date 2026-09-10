@@ -6,6 +6,10 @@
 
 - **多源数据整合**：支持搜索并下载 Sentinel (2/3/5P), Landsat, MODIS 以及 NASA SWOT 等多种卫星数据。
 - **可恢复采集运行**：SQLite 持久化分页游标、下载批次和文件尝试，支持暂停、恢复、取消、失败重试与进程重启恢复。
+- **可恢复协议提交**：Registry 与 STAC 先写入暂存区，再通过提交日志发布；进程中断后可自动回滚准备阶段或继续发布阶段。
+- **数据健康中心**：检查 Registry、STAC、Source 文件、物化清单和实体/Zarr 输出的一致性，可选执行完整 SHA-256 校验。
+- **可控物化运行**：把 SHP、属性表、NetCDF 和已有 Zarr 作为持久化运行处理，支持暂停、继续、取消、重试与进度查看。
+- **实体与 Zarr 探索**：分页查看 Parquet/GeoParquet、在地图预览矢量，并按变量读取带缓存的轻量 Zarr 切片。
 - **字节级进度监控**：具备精确到字节的下载进度追踪，支持实时显示下载速度和预计剩余时间（ETA）。
 - **NASA SWOT 深度支持**：完美集成 NASA CMR 接口，支持 SWOT L2/L4 等复杂数据集的搜索与自动认证下载。
 - **AI 智能集成**：内置 `stac_downloader` Skill，支持 AI Agent 直接执行检索和下载任务。
@@ -18,7 +22,7 @@
 uv sync
 ```
 ```bash
-pip install fastapi uvicorn requests pystac-client planetary-computer pyarrow shapely tqdm
+pip install fastapi uvicorn requests pystac-client planetary-computer pyarrow rasterio pyproj shapely zarr tqdm
 ```
 
 ### 2. NASA 认证 (针对 SWOT 等数据)
@@ -47,8 +51,10 @@ python stac_api.py
 - **概览**：资产、产品、变量、协议层容量、运行历史和目录一致性状态。
 - **数据目录**：按产品浏览资产，查看相对路径、SHA-256、来源 URL、空间 Geometry 和血缘运行。
 - **空间浏览**：根据 Registry 中的 STAC Geometry 绘制资产覆盖范围。
-- **实体与数组**：发现 `entities/` 中的文件和 `arrays/` 中的 Zarr Store；尚未物化时显示明确的预留状态。
+- **实体与数组**：分页、搜索 Parquet/GeoParquet 行，预览矢量 Geometry；查看 Zarr 变量、维度、Chunk、统计量和轻量热力切片。
 - **下载任务**：提交 STAC/NASA 查询，轮询显示实时进度、成功、跳过和失败项，并查看持久化运行历史。
+- **物化任务**：从本地水文目录或已有 Zarr 创建 Materialization Run，并控制暂停、继续、取消和失败重试。
+- **数据健康**：执行快速或完整审计，查看分级问题、修复建议、磁盘容量和审计历史。
 - **协议与系统**：查看协议 JSON、各存储层以及分页读取 Parquet Registry。
 
 页面读取的都是真实协议数据，不生成演示记录。当前的空间页面展示资产覆盖 Geometry，不直接渲染完整 GeoTIFF；Zarr 页面读取 Store 元数据，不将原始文件伪装为 Zarr。
@@ -117,7 +123,36 @@ CLI、API 和 Skill 共用 Acquisition Run Module。CLI 前台执行同一持久
 
 ## Earth Zarr Protocol 0.1
 
-每次通过 API 或 CLI 下载时，程序都会自动初始化并维护 `/Volumes/Untitled/stac/` 下的 Earth Lake。当前阶段保存原始 Source Layer，并维护 STAC 和语义注册表；不会在下载时伪装生成 Zarr，后续物化任务再向 `arrays/` 写入连续数据立方体。可通过 `EARTH_LAKE_ROOT` 环境变量覆盖该位置。
+每次通过 API 或 CLI 下载时，程序都会自动初始化并维护 Earth Lake。检测到 `/Volumes/Untitled/` 时默认使用 `/Volumes/Untitled/stac/`，其他环境回退到项目的 `downloads/`；可通过 `EARTH_LAKE_ROOT` 环境变量显式覆盖。当前阶段保存原始 Source Layer，并维护 STAC 和语义注册表；不会在下载时伪装生成 Zarr，后续物化任务再向 `arrays/` 写入连续数据立方体。
+
+### 本地水文数据物化
+
+`hydro_materializer.py` 将 `/Volumes/Untitled/data` 中 hydrodataset 已适配的数据物化到协议层：SHP 写为 GeoParquet，静态属性 CSV/TXT/XLSX 写为 Parquet，标准化 `*_D.nc` 写为 basin × time Zarr v3。源数据保持只读；每个输出在 `manifests/materializations/hydrodatasets.json` 中记录逻辑物化 ID、来源指纹、内容 SHA-256、大小、行数、字段、CRS 和范围，只有内容校验通过的未变化输出才会复用。
+
+先查看可识别数据：
+
+```bash
+uv run python hydro_materializer.py inventory
+```
+
+物化实体，并复用 `/Volumes/Untitled/zarr-v3` 中已经生成的 Zarr：
+
+```bash
+uv run --extra hydrology python hydro_materializer.py materialize --kind all
+```
+
+分数据集转换尚未物化的标准化 NetCDF：
+
+```bash
+uv run --extra hydrology python hydro_materializer.py materialize \
+  --kind arrays \
+  --dataset camels_se \
+  --convert-netcdf
+```
+
+`--dataset` 可以重复指定，`--limit` 可用于小批量验证；有限额的实体导入会在小体积 SHP 和属性表之间交替取样。已有 Zarr 在同一文件系统中优先通过硬链接复用数据块，失败时才复制；复制中断后会保留 `.partial` 目录，重跑时按文件大小校验并跳过已完成块。标准 NetCDF 会先顺序暂存到本机再转换，避免在外置盘上进行大量随机切片读取。程序不会移动或删除 `/Volumes/Untitled/data` 和 `/Volumes/Untitled/zarr-v3`。物化完成后，“实体与数组”页面会自动显示数据集、类别、记录数、大小和 Zarr 元数据。
+
+也可以在“物化任务”页面创建持久化运行。运行进度保存在 `registry/materialization_state.sqlite`；服务重启会把中断的运行重新排队，手工暂停的运行保持暂停。暂停是协作式的，会在当前源文件或 Zarr 分块文件处理完成后的检查点生效。
 
 ```text
 /Volumes/Untitled/stac/
@@ -126,11 +161,11 @@ CLI、API 和 Skill 共用 Acquisition Run Module。CLI 前台执行同一持久
 ├── registry/                 # Parquet 事实注册表及 acquisition_state.sqlite
 ├── source/                   # 不可变原始下载资产
 │   └── <catalog>/<collection>/<item_id>/
-├── entities/                 # basin/station/river/patch 预留层
-├── arrays/                   # Zarr 物化层，当前只初始化目录
+├── entities/                 # basin/station/river/patch GeoParquet 与属性 Parquet
+├── arrays/                   # basin × time 水文时序和静态属性 Zarr v3
 ├── virtual/                  # Kerchunk/VirtualiZarr 预留层
 ├── manifests/               # Acquisition 请求/搜索页快照及训练样本清单
-└── cache/                   # 可重建缓存
+└── cache/                   # 可重建的预览与物化分块缓存
 ```
 
 每次下载自动维护：
@@ -141,6 +176,8 @@ CLI、API 和 Skill 共用 Acquisition Run Module。CLI 前台执行同一持久
 - `registry/assets.parquet`：本地路径、来源 URL、大小、SHA-256、时空范围和 lineage。
 - `sources/products/variables/grids.parquet`：数据源、产品、变量语义和原生网格。
 - `catalog/stac/`：每个 source granule 对应一个 STAC Item，文件对应 STAC Asset。
+
+Registry 与 STAC 不直接分别覆盖。每次资产登记会创建 Protocol Commit，在 `manifests/protocol_commits/.staging/` 暂存待发布文件，并在 `manifests/protocol_commits/` 记录准备和发布状态。暂存数据属于恢复所需的事务状态，不放入可清理的 `cache/`。准备阶段失败不会污染正式协议；发布阶段被中断时，下次启动会根据日志继续完成，因此 Registry 与 STAC 可以恢复到同一提交。
 
 下载过程还会自动维护三层元数据：
 
@@ -163,6 +200,9 @@ API 任务状态会返回 `run_id` 和 `protocol_root`。重复下载不会新�
 - `stac_api.py`: FastAPI 服务核心，管理后台下载流与状态。
 - `stac_core.py`: API 与 CLI 共用的 catalog 查询、asset 解析和安全下载逻辑。
 - `earth_lake.py`: Earth Zarr Protocol 初始化、Parquet registry 和 STAC 维护逻辑。
+- `protocol_commit.py`: Registry、STAC 和物化清单的暂存、提交日志与中断恢复。
+- `materialization.py`: 持久化 Materialization Run 状态、调度与控制。
+- `lake_health.py`: 数据健康审计、问题分级和持久化报告。
 - `lake_monitor.py`: 监控页面使用的只读目录统计、Registry 查询和资源发现逻辑。
 - `reindex_lake.py`: 为已有 Source Layer 回填 Collection、产品 profile 和 GeoTIFF 元数据。
 - `frontend/`: 无构建依赖的监控控制台页面、样式和交互脚本。
@@ -185,6 +225,12 @@ API 任务状态会返回 `run_id` 和 `protocol_root`。重复下载不会新�
 - **`GET /lake/registries/{table}`**: 分页读取白名单内的 Parquet Registry。
 - **`GET /lake/resources/{layer}`**: 浏览指定协议层中的相对资源路径。
 - **`GET /lake/arrays`**: 发现 Zarr Store 及其元数据文件。
+- **`GET /lake/entities/page`**、**`GET /lake/entities/features`**: 分页读取实体属性，或返回 GeoParquet 空间要素预览。
+- **`GET /lake/arrays/detail`**、**`GET /lake/arrays/slice`**: 查看 Zarr 结构并读取受限大小、可缓存的变量切片。
+- **`POST /materializations`**、**`GET /materializations`**: 创建和浏览 Materialization Run。
+- **`POST /materializations/{run_id}/pause|resume|cancel|retry`**: 控制物化运行。
+- **`GET /health`**、**`GET /health/live`**、**`GET /health/ready`**: 分别提供 liveness 和只读 readiness；ready 失败时返回 HTTP 503，不检查外部 STAC 可用性。
+- **`GET /lake/health`**、**`POST /lake/health/audits`**: 查看最近健康报告或启动快速/完整审计；审计不会自动修复数据。
 
 ---
 

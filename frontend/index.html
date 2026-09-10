@@ -6,7 +6,7 @@
     <meta name="description" content="Earth Lake 数据监控与采集控制台" />
     <title>Earth Lake Console</title>
     <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.6.2/dist/maplibre-gl.css" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260717-2" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260721-1" />
   </head>
   <body>
     <div class="app-shell">
@@ -34,8 +34,14 @@
           <button class="nav-item" data-route="downloads">
             <span class="nav-icon">05</span><span>下载任务</span>
           </button>
+          <button class="nav-item" data-route="materializations">
+            <span class="nav-icon">06</span><span>物化任务</span>
+          </button>
+          <button class="nav-item" data-route="health">
+            <span class="nav-icon">07</span><span>数据健康</span>
+          </button>
           <button class="nav-item" data-route="system">
-            <span class="nav-icon">06</span><span>协议与系统</span>
+            <span class="nav-icon">08</span><span>协议与系统</span>
           </button>
         </nav>
 
@@ -87,6 +93,6 @@
 
     <div class="toast-region" id="toastRegion" aria-live="polite"></div>
     <script src="https://unpkg.com/maplibre-gl@5.6.2/dist/maplibre-gl.js" defer></script>
-    <script src="/static/app.js?v=20260720-3" defer></script>
+    <script src="/static/app.js?v=20260721-4" defer></script>
   </body>
 </html>

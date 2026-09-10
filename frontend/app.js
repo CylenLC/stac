@@ -10,11 +10,15 @@ const state = {
   arrays: [],
   resources: {},
   protocol: {},
+  health: null,
+  healthAudits: [],
+  materializations: [],
   selectedAssetId: null,
   spatialFeatures: [],
   exactSpatialAssetIds: new Set(),
   exactSpatialRequest: 0,
   exploreMap: null,
+  entityMap: null,
   registryTable: "sources",
   pollTick: 0,
   runCursor: null,
@@ -53,6 +57,8 @@ const formatDuration = (seconds) => {
 
 const shortId = (value, length = 12) => value && value.length > length ? `${value.slice(0, length)}…` : value || "—";
 const badge = (status) => `<span class="badge ${escapeHtml(status || "reserved")}">${escapeHtml(status || "reserved")}</span>`;
+const ACTIVE_TASK_STATUSES = new Set(["queued", "recovering", "searching", "discovering", "planning", "downloading", "finalizing", "cancelling"]);
+const isTaskActive = (task) => ACTIVE_TASK_STATUSES.has(task.status);
 
 function idempotencyKey() {
   if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
@@ -83,11 +89,11 @@ function toast(message, type = "info") {
 }
 
 async function loadBaseData() {
-  const [summary, products, assets, runs, tasks] = await Promise.all([
+  const [summary, products, assets, runs, tasks, health] = await Promise.all([
     api("/lake/summary"), api("/lake/products"), api("/lake/assets?limit=500"),
-    api("/acquisitions?limit=50"), api("/stac/tasks"),
+    api("/acquisitions?limit=50"), api("/stac/tasks"), api("/lake/health"),
   ]);
-  Object.assign(state, {summary, products, assets: assets.items, runs: runs.items, runCursor: runs.next_cursor, tasks});
+  Object.assign(state, {summary, products, assets: assets.items, runs: runs.items, runCursor: runs.next_cursor, tasks, health});
   document.querySelector("#apiPulse").className = "pulse ok";
   document.querySelector("#apiState").textContent = "API 已连接";
   document.querySelector("#protocolVersion").textContent = summary.protocol?.version || "0.1";
@@ -101,7 +107,7 @@ function pageHeader(eyebrow, title, description, meta = "") {
 function renderOverview() {
   const summary = state.summary;
   const counts = summary.registry_counts;
-  const active = state.tasks.filter((task) => !["completed", "partial", "failed"].includes(task.status));
+  const active = state.tasks.filter(isTaskActive);
   const issues = summary.missing_assets + summary.unregistered_source_files + state.runs.filter((run) => ["failed", "partial"].includes(run.status)).length;
   const layers = summary.layer_stats;
   const maxBytes = Math.max(...layers.map((layer) => layer.byte_size), 1);
@@ -435,10 +441,10 @@ async function hydrateSelectedSpatialFeature() {
 
 async function renderEntities() {
   if (!state.resources.entities) {
-    const [entities, arrayResources, arrays] = await Promise.all([
-      api("/lake/resources/entities"), api("/lake/resources/arrays"), api("/lake/arrays"),
+    const [entities, arrays] = await Promise.all([
+      api("/lake/resources/entities"), api("/lake/arrays"),
     ]);
-    state.resources.entities = entities; state.resources.arrays = arrayResources; state.arrays = arrays;
+    state.resources.entities = entities; state.arrays = arrays;
   }
   const entityFiles = state.resources.entities.items.filter((item) => item.kind === "file");
   main.innerHTML = pageHeader("Typed Resources", "实体与数组", "查看 basin、station、river、patch 等表格/矢量实体，以及已物化的 Zarr 数据仓。", `${entityFiles.length} 个实体文件 · ${state.arrays.length} 个 Zarr`) + `
@@ -452,14 +458,21 @@ async function renderEntities() {
         ${state.arrays.length ? arraysTable(state.arrays) : emptyState("Z", "数组层尚未物化", "当前下载只维护不可变 Source Layer，不会把 GeoTIFF 伪装为 Zarr。后续物化的数据仓会自动出现在此处。")}
       </article>
     </section>`;
+  bindEntityRows();
 }
 
 function resourceTable(items) {
-  return `<div class="table-wrap"><table class="data-table"><thead><tr><th>资源</th><th>类型</th><th>大小</th><th>更新时间</th></tr></thead><tbody>${items.map((item) => `<tr><td class="mono">${escapeHtml(item.path)}</td><td>${escapeHtml(item.suffix || item.kind)}</td><td>${formatBytes(item.byte_size)}</td><td>${formatDate(item.modified_at)}</td></tr>`).join("")}</tbody></table></div>`;
+  return `<div class="table-wrap"><table class="data-table entity-array-table"><thead><tr><th>资源</th><th>数据集</th><th>类别</th><th>记录</th><th>大小</th><th>更新时间</th><th>查看</th></tr></thead><tbody>${items.map((item) => {
+    const materialization = item.materialization || {};
+    return `<tr><td class="mono path-cell" title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</td><td>${escapeHtml(materialization.dataset_id || "—")}</td><td>${escapeHtml(materialization.kind || item.suffix || item.kind)}</td><td>${materialization.row_count == null ? "—" : Number(materialization.row_count).toLocaleString()}</td><td>${formatBytes(item.byte_size)}</td><td>${formatDate(item.modified_at)}</td><td class="table-action-cell"><button class="table-detail-button" type="button" data-entity-path="${escapeHtml(item.path)}">详情</button></td></tr>`;
+  }).join("")}</tbody></table></div>`;
 }
 
 function arraysTable(items) {
-  return `<div class="table-wrap"><table class="data-table"><thead><tr><th>Store</th><th>文件</th><th>大小</th><th>更新时间</th></tr></thead><tbody>${items.map((item) => `<tr><td class="mono">${escapeHtml(item.path)}</td><td>${item.file_count}</td><td>${formatBytes(item.byte_size)}</td><td>${formatDate(item.modified_at)}</td></tr>`).join("")}</tbody></table></div>`;
+  return `<div class="table-wrap"><table class="data-table entity-array-table"><thead><tr><th>Store</th><th>数据集</th><th>类别</th><th>文件</th><th>大小</th><th>更新时间</th><th>查看</th></tr></thead><tbody>${items.map((item) => {
+    const materialization = item.materialization || {};
+    return `<tr><td class="mono path-cell" title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</td><td>${escapeHtml(materialization.dataset_id || "—")}</td><td>${escapeHtml(materialization.kind || "Zarr")}</td><td>${item.file_count == null ? "—" : item.file_count}</td><td>${formatBytes(item.byte_size)}</td><td>${formatDate(item.modified_at)}</td><td class="table-action-cell"><button class="table-detail-button" type="button" data-array-path="${escapeHtml(item.path)}">详情</button></td></tr>`;
+  }).join("")}</tbody></table></div>`;
 }
 
 function renderDownloads() {
@@ -475,6 +488,7 @@ function renderDownloads() {
           <label class="field"><span>开始日期</span><input type="date" name="start_date" value="${start.toISOString().slice(0,10)}" required></label>
           <label class="field"><span>结束日期</span><input type="date" name="end_date" value="${today.toISOString().slice(0,10)}" required></label>
           <label class="field"><span>最多条目（可选）</span><input type="number" name="max_items" min="1" placeholder="留空则自动分页至结束"></label>
+          <label class="field"><span>指定 Asset（可选）</span><input name="asset_keys" placeholder="例如 B04,Fmask；留空使用自动策略"></label>
           <label class="checkbox"><input type="checkbox" name="only_main" checked>只下载代表性资产</label>
           <label class="field wide"><span>AOI (WKT)</span><textarea name="wkt" required>POLYGON((-125 24,-66 24,-66 49,-125 49,-125 24))</textarea></label>
           <div class="form-actions wide"><span class="form-hint">NASA 受保护数据需要提前配置 ~/.netrc。未知远端文件大小时，ETA 可能不可用。</span><button class="primary-button" type="submit">开始下载</button></div>
@@ -498,7 +512,7 @@ function renderDownloads() {
 
 function tasksTable(tasks) {
   if (!tasks.length) return emptyState("T", "没有实时任务", "创建下载后，文件数、字节进度、ETA、跳过和失败信息会显示在这里。", "div");
-  return `<div class="table-wrap"><table class="data-table"><thead><tr><th>任务</th><th>状态</th><th>进度</th><th>传输</th><th>当前文件 / 消息</th></tr></thead><tbody>${tasks.map((task) => `<tr><td class="mono" title="${task.task_id}">${shortId(task.task_id)}</td><td>${badge(task.status)}</td><td class="progress-cell"><span class="mono">${Number(task.progress || 0).toFixed(1)}% · ETA ${formatDuration(task.remaining_time)}</span><div class="bar-track"><span style="width:${task.progress || 0}%"></span></div></td><td><span class="mono">${task.completed_files || task.results.length + task.skipped.length}/${task.total_files || "?"}</span><br><span class="muted">${formatBytes(task.downloaded_bytes)} / ${task.total_bytes ? formatBytes(task.total_bytes) : "未知"}</span></td><td class="truncate" title="${escapeHtml(task.current_file || task.message)}"><strong>${escapeHtml(task.current_file || task.message)}</strong><br><span class="muted">${task.results.length + task.skipped.length} ok · ${task.failures.length} failed</span></td></tr>`).join("")}</tbody></table></div>`;
+  return `<div class="table-wrap"><table class="data-table"><thead><tr><th>任务</th><th>状态</th><th>进度</th><th>传输</th><th>当前文件 / 消息</th></tr></thead><tbody>${tasks.map((task) => `<tr><td class="mono" title="${task.task_id}">${shortId(task.task_id)}</td><td>${badge(task.status)}</td><td class="progress-cell"><span class="mono">${Number(task.progress || 0).toFixed(1)}% · ETA ${formatDuration(task.remaining_time)}</span><div class="bar-track"><span style="width:${task.progress || 0}%"></span></div></td><td><span class="mono">${task.completed_files || 0}/${task.total_files || "?"}</span><br><span class="muted">${formatBytes(task.downloaded_bytes)} / ${task.total_bytes ? formatBytes(task.total_bytes) : "未知"}</span></td><td class="truncate" title="${escapeHtml(task.current_file || task.message)}"><strong>${escapeHtml(task.current_file || task.message)}</strong><br><span class="muted">${task.completed_files || 0} ok · ${task.failed_files || task.failures?.length || 0} failed${task.planning_errors ? ` · ${task.planning_errors} planning errors` : ""}</span></td></tr>`).join("")}</tbody></table></div>`;
 }
 
 function runsTable(runs, detailed) {
@@ -509,7 +523,7 @@ function runsTable(runs, detailed) {
 function runActions(run) {
   if (["queued","recovering","discovering","planning","downloading","finalizing"].includes(run.status)) return `<button class="table-action" data-run-action="pause" data-run-id="${run.run_id}">暂停</button><button class="table-action danger" data-run-action="cancel" data-run-id="${run.run_id}">取消</button>`;
   if (["paused","auth_required"].includes(run.status)) return `<button class="table-action" data-run-action="resume" data-run-id="${run.run_id}">继续</button><button class="table-action danger" data-run-action="cancel" data-run-id="${run.run_id}">取消</button>`;
-  if (["failed","partial"].includes(run.status)) return `<button class="table-action" data-run-action="retry" data-run-id="${run.run_id}">重试失败项</button>`;
+  if (["failed","partial"].includes(run.status)) return `<button class="table-action" data-run-action="retry" data-run-id="${run.run_id}">重试未完成项</button>`;
   return '<span class="muted">—</span>';
 }
 
@@ -535,6 +549,8 @@ async function submitDownload(event) {
     start_date: data.get("start_date"), end_date: data.get("end_date"), wkt: data.get("wkt"),
   };
   if (data.get("max_items")) body.max_items = Number(data.get("max_items"));
+  const assetKeys = String(data.get("asset_keys") || "").split(",").map((value) => value.trim()).filter(Boolean);
+  if (assetKeys.length) body.asset_keys = [...new Set(assetKeys)];
   button.disabled = true; button.textContent = "正在创建…";
   try {
     const result = await api(`/acquisitions?only_main=${data.get("only_main") === "on"}`, {method: "POST", headers: {"Content-Type": "application/json", "Idempotency-Key": idempotencyKey()}, body: JSON.stringify(body)});
@@ -556,12 +572,168 @@ function bindRunControls() {
     button.disabled = true;
     try {
       await api(`/acquisitions/${encodeURIComponent(button.dataset.runId)}/${button.dataset.runAction}`, {method: "POST"});
-      toast(`运行已${{pause:"暂停",resume:"继续",cancel:"取消",retry:"进入重试队列"}[button.dataset.runAction]}`);
+      toast(`运行已${{pause:"暂停",resume:"继续",cancel:"取消",retry:"进入未完成项重试队列"}[button.dataset.runAction]}`);
       await refreshTasks();
       const page = await api("/acquisitions?limit=50"); state.runs = page.items; state.runCursor = page.next_cursor;
       renderDownloads();
     } catch (error) { toast(`操作失败：${error.message}`, "error"); button.disabled = false; }
   }));
+}
+
+async function renderMaterializations() {
+  state.materializations = await api("/materializations?limit=100");
+  const active = state.materializations.filter((run) => !["completed", "partial", "failed", "cancelled"].includes(run.status));
+  main.innerHTML = pageHeader(
+    "Materialization Control",
+    "物化任务",
+    "把本地 SHP、属性表、标准 NetCDF 和已有 Zarr 持久化为协议实体与数组。",
+    `${state.materializations.length} 次运行 · ${active.length} 个活动运行`,
+  ) + `
+    <section class="download-grid">
+      <article class="panel">
+        <header class="panel-header"><div><h2>新建物化</h2><p>输出写入当前 Earth Lake，并维护物化 manifest</p></div></header>
+        <form id="materializationForm" class="download-form">
+          <label class="field wide"><span>源数据目录</span><input name="data_root" value="/Volumes/Untitled/data" required></label>
+          <label class="field wide"><span>已有 Zarr 目录</span><input name="existing_zarr_root" value="/Volumes/Untitled/zarr-v3"></label>
+          <label class="field wide"><span>hydrodataset 项目</span><input name="hydrodataset_project" value="/Users/cylenlc/work/hydrodataset"></label>
+          <label class="field wide"><span>数据集（可选，逗号分隔）</span><input name="datasets" placeholder="例如 camels_us, camels_se"></label>
+          <label class="field"><span>每类最多处理（可选）</span><input type="number" name="limit" min="1" placeholder="留空处理全部"></label>
+          <div class="materialization-options">
+            <label class="checkbox"><input type="checkbox" name="entities" checked>实体</label>
+            <label class="checkbox"><input type="checkbox" name="arrays" checked>数组</label>
+            <label class="checkbox"><input type="checkbox" name="convert_netcdf">转换标准 NetCDF</label>
+          </div>
+          <div class="form-actions wide"><span class="form-hint">暂停在当前文件或 Zarr chunk 完成后生效；重跑会复用未变化输出。</span><button class="primary-button" type="submit">创建物化运行</button></div>
+        </form>
+      </article>
+      <article class="panel">
+        <header class="panel-header"><div><h2>当前进度</h2><p>持久化状态，服务重启后自动恢复</p></div></header>
+        <div class="panel-body status-list">${active.map((run) => `<div class="status-item"><div><strong>${escapeHtml(shortId(run.run_id, 20))}</strong><small>${Number(run.progress || 0).toFixed(1)}% · ${run.completed_sources}/${run.total_sources || "?"} · ${escapeHtml(run.message)}</small></div>${badge(run.status)}</div>`).join("") || emptyInline("当前没有活动物化运行")}</div>
+      </article>
+    </section>
+    <article class="panel">
+      <header class="panel-header"><div><h2>物化运行历史</h2><p>可暂停、恢复、取消和重试；点击结果数量查看运行输出</p></div></header>
+      ${materializationRunsTable(state.materializations)}
+    </article>`;
+  document.querySelector("#materializationForm").addEventListener("submit", submitMaterialization);
+  bindMaterializationControls();
+}
+
+function materializationRunsTable(runs) {
+  if (!runs.length) return emptyState("M", "暂无物化运行", "创建运行后，其状态和输出会显示在这里。");
+  return `<div class="table-wrap"><table class="data-table"><thead><tr><th>运行</th><th>状态</th><th>范围</th><th>进度</th><th>结果</th><th>开始时间</th><th>控制</th></tr></thead><tbody>${runs.map((run) => `<tr><td class="mono" title="${escapeHtml(run.run_id)}">${escapeHtml(shortId(run.run_id, 18))}</td><td>${badge(run.status)}</td><td>${escapeHtml((run.request.datasets || []).join(", ") || "全部数据集")}<br><span class="muted">${escapeHtml((run.request.kinds || []).join(" + "))}</span></td><td class="progress-cell"><span class="mono">${Number(run.progress || 0).toFixed(1)}% · ${run.completed_sources}/${run.total_sources || "?"}</span><div class="bar-track"><span style="width:${Math.min(100, run.progress || 0)}%"></span></div></td><td>${run.materialized_count} new · ${run.skipped_count} reused · ${run.failed_count} failed</td><td>${formatDate(run.started_at || run.created_at)}</td><td>${materializationActions(run)}</td></tr>`).join("")}</tbody></table></div>`;
+}
+
+function materializationActions(run) {
+  if (["queued", "inventory", "running", "finalizing"].includes(run.status)) return `<button class="table-detail-button" data-mat-action="pause" data-mat-id="${escapeHtml(run.run_id)}">暂停</button> <button class="table-detail-button" data-mat-action="cancel" data-mat-id="${escapeHtml(run.run_id)}">取消</button>`;
+  if (run.status === "paused") return `<button class="table-detail-button" data-mat-action="resume" data-mat-id="${escapeHtml(run.run_id)}">继续</button> <button class="table-detail-button" data-mat-action="cancel" data-mat-id="${escapeHtml(run.run_id)}">取消</button>`;
+  if (["failed", "partial"].includes(run.status)) return `<button class="table-detail-button" data-mat-action="retry" data-mat-id="${escapeHtml(run.run_id)}">重试</button>`;
+  return "—";
+}
+
+async function submitMaterialization(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector("button[type=submit]");
+  const data = new FormData(form);
+  const kinds = [data.get("entities") === "on" ? "entities" : null, data.get("arrays") === "on" ? "arrays" : null].filter(Boolean);
+  if (!kinds.length) { toast("至少选择实体或数组", "error"); return; }
+  const limit = String(data.get("limit") || "").trim();
+  const body = {
+    data_root: data.get("data_root"),
+    existing_zarr_root: data.get("existing_zarr_root") || undefined,
+    hydrodataset_project: data.get("hydrodataset_project") || undefined,
+    datasets: String(data.get("datasets") || "").split(",").map((value) => value.trim()).filter(Boolean),
+    kinds,
+    limit: limit ? Number(limit) : null,
+    convert_netcdf: data.get("convert_netcdf") === "on",
+  };
+  button.disabled = true;
+  try {
+    const run = await api("/materializations", {method: "POST", body: JSON.stringify(body)});
+    toast(`物化运行已创建：${shortId(run.run_id)}`);
+    await renderMaterializations();
+  } catch (error) { toast(`创建失败：${error.message}`, "error"); button.disabled = false; }
+}
+
+function bindMaterializationControls() {
+  document.querySelectorAll("[data-mat-action]").forEach((button) => button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      await api(`/materializations/${encodeURIComponent(button.dataset.matId)}/${button.dataset.matAction}`, {method: "POST"});
+      toast(`物化运行已执行${{pause:"暂停",resume:"继续",cancel:"取消",retry:"重试"}[button.dataset.matAction]}`);
+      await renderMaterializations();
+    } catch (error) { toast(`操作失败：${error.message}`, "error"); button.disabled = false; }
+  }));
+}
+
+async function renderHealth() {
+  const [latest, audits] = await Promise.all([
+    api("/lake/health"),
+    api("/lake/health/audits?limit=20"),
+  ]);
+  state.health = latest;
+  state.healthAudits = audits;
+  const summary = latest.summary || {critical: 0, error: 0, warning: 0, total: 0};
+  const stats = latest.stats || {};
+  const issues = latest.issues || [];
+  const running = audits.find((audit) => ["queued", "running"].includes(audit.status));
+  main.innerHTML = pageHeader(
+    "Data Health",
+    "数据健康中心",
+    "核对文件系统、Registry、STAC、物化清单和校验和，审计结果会持久化保存。",
+    latest.status === "not_run" ? "尚未执行审计" : `${escapeHtml(latest.mode || "quick")} · ${formatDate(latest.finished_at || latest.started_at)}`,
+  ) + `
+    <div class="health-actions">
+      <button class="primary-button" id="quickAudit" ${running ? "disabled" : ""}>快速审计</button>
+      <button class="quiet-button" id="fullAudit" ${running ? "disabled" : ""}>完整校验和审计</button>
+      <span class="muted">${running ? `正在执行 ${escapeHtml(running.run_id)}` : "完整审计会读取所有已登记资产内容"}</span>
+    </div>
+    <section class="metric-grid">
+      ${metric("严重问题", summary.critical || 0, "Registry 损坏或校验和不一致")}
+      ${metric("错误", summary.error || 0, "缺失文件或协议事实不一致")}
+      ${metric("警告", summary.warning || 0, "孤立文件、partial 或未登记输出")}
+      ${metric("磁盘可用", formatBytes(stats.disk_free_bytes), stats.disk_total_bytes ? `总容量 ${formatBytes(stats.disk_total_bytes)}` : "容量信息不可用")}
+    </section>
+    <section class="content-grid">
+      <article class="panel">
+        <header class="panel-header"><div><h2>问题清单</h2><p>按严重程度排序，修复动作当前作为建议展示</p></div>${badge(summary.total ? "partial" : latest.status === "completed" ? "completed" : latest.status)}</header>
+        ${issues.length ? healthIssuesTable(issues) : emptyState("✓", latest.status === "not_run" ? "尚未执行审计" : "未发现一致性问题", latest.status === "not_run" ? "点击快速审计生成第一份持久化健康报告。" : "本次审计范围内没有发现问题。")}
+      </article>
+      <article class="panel">
+        <header class="panel-header"><div><h2>审计历史</h2><p>最近 20 次持久化报告</p></div></header>
+        <div class="panel-body status-list">${audits.map((audit) => `<div class="status-item"><div><strong>${escapeHtml(audit.mode || "quick")} · ${escapeHtml(shortId(audit.run_id, 18))}</strong><small>${formatDate(audit.finished_at || audit.started_at)} · ${(audit.summary || {}).total || 0} issues</small></div>${badge(audit.status)}</div>`).join("") || emptyInline("暂无审计历史")}</div>
+      </article>
+    </section>`;
+  document.querySelector("#quickAudit").addEventListener("click", () => startHealthAudit(false));
+  document.querySelector("#fullAudit").addEventListener("click", () => startHealthAudit(true));
+}
+
+function healthIssuesTable(issues) {
+  const order = {critical: 0, error: 1, warning: 2, info: 3};
+  const sorted = [...issues].sort((left, right) => (order[left.severity] ?? 9) - (order[right.severity] ?? 9));
+  return `<div class="table-wrap"><table class="data-table health-table"><thead><tr><th>级别</th><th>问题</th><th>位置</th><th>建议动作</th></tr></thead><tbody>${sorted.map((issue) => `<tr><td>${badge(issue.severity)}</td><td><strong>${escapeHtml(issue.code)}</strong><br><span class="muted">${escapeHtml(issue.message)}</span></td><td class="mono path-cell">${escapeHtml(issue.path || "—")}</td><td class="mono">${escapeHtml(issue.repair)}</td></tr>`).join("")}</tbody></table></div>`;
+}
+
+async function startHealthAudit(fullChecksum) {
+  try {
+    const audit = await api(`/lake/health/audits?full_checksum=${fullChecksum}`, {method: "POST"});
+    toast(fullChecksum ? "完整数据审计已启动" : "快速数据审计已启动");
+    await waitForHealthAudit(audit.run_id);
+  } catch (error) { toast(`审计启动失败：${error.message}`, "error"); }
+}
+
+async function waitForHealthAudit(runId) {
+  for (;;) {
+    const audit = await api(`/lake/health/audits/${encodeURIComponent(runId)}`);
+    if (["completed", "failed", "interrupted"].includes(audit.status)) {
+      state.health = audit;
+      await renderHealth();
+      toast(audit.status === "completed" ? `审计完成：发现 ${(audit.summary || {}).total || 0} 个问题` : `审计失败：${audit.error || audit.status}`, audit.status === "completed" ? "info" : "error");
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
 }
 
 async function renderSystem() {
@@ -618,6 +790,114 @@ function openAsset(assetId) {
   document.querySelector("#detailDrawer").classList.remove("hidden");
 }
 
+function showDrawer(eyebrow, title, body) {
+  document.querySelector("#drawerEyebrow").textContent = eyebrow;
+  document.querySelector("#drawerTitle").textContent = title;
+  document.querySelector("#drawerBody").innerHTML = body;
+  document.querySelector("#drawerBackdrop").classList.remove("hidden");
+  document.querySelector("#detailDrawer").classList.remove("hidden");
+}
+
+async function openEntityDetail(path) {
+  try {
+    const detail = await api(`/lake/resources/detail?path=${encodeURIComponent(path)}`);
+    const fields = detail.schema || [];
+    const metadata = detail.metadata || {};
+    showDrawer("Entity / Table", detail.name, `
+      <section class="drawer-section"><h3>文件信息</h3><dl class="schema-grid">
+        ${definition("Format", detail.format || detail.suffix)}${definition("Rows", detail.row_count == null ? null : Number(detail.row_count).toLocaleString())}${definition("Row groups", detail.row_group_count)}${definition("Size", formatBytes(detail.byte_size))}${definition("Updated", formatDate(detail.modified_at))}${definition("Dataset", detail.materialization?.dataset_id)}
+      </dl></section>
+      <section class="drawer-section"><h3>协议路径</h3><p class="mono muted path-cell">${escapeHtml(detail.path)}</p></section>
+      <section class="drawer-section"><h3>字段 (${fields.length})</h3>${fields.length ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>名称</th><th>类型</th><th>可为空</th></tr></thead><tbody>${fields.map((field) => `<tr><td class="mono">${escapeHtml(field.name)}</td><td class="mono">${escapeHtml(field.type)}</td><td>${field.nullable ? "是" : "否"}</td></tr>`).join("")}</tbody></table></div>` : emptyInline("该文件不是支持预览 Schema 的 Parquet 格式。")}</section>
+      <section class="drawer-section"><h3>元数据</h3><pre class="json-view">${escapeHtml(JSON.stringify(metadata, null, 2))}</pre></section>
+      ${detail.format === "GeoParquet" ? `<section class="drawer-section"><h3>空间要素预览</h3><div class="entity-mini-map" id="entityMiniMap"><div class="page-loading"><span class="loader"></span></div></div></section>` : ""}
+      <section class="drawer-section"><h3>记录浏览</h3><div class="entity-browser-toolbar"><input id="entityQuery" type="search" placeholder="搜索当前实体"><button class="table-detail-button" id="entitySearch">搜索</button></div><div id="entityPage"><div class="page-loading" style="min-height:140px"><span class="loader"></span></div></div></section>`);
+    await loadEntityPage(path, 0, "");
+    if (detail.format === "GeoParquet") await loadEntityMap(path);
+  } catch (error) { toast(`实体详情读取失败：${error.message}`, "error"); }
+}
+
+async function openArrayDetail(path) {
+  try {
+    const detail = await api(`/lake/arrays/detail?path=${encodeURIComponent(path)}`);
+    const variables = detail.variables || [];
+    showDrawer("Zarr Array Store", detail.name, `
+      <section class="drawer-section"><h3>Store 信息</h3><dl class="schema-grid">
+        ${definition("Zarr format", detail.zarr_format)}${definition("Variables", variables.length)}${definition("Dataset", detail.materialization?.dataset_id)}${definition("Kind", detail.materialization?.kind)}
+      </dl></section>
+      <section class="drawer-section"><h3>协议路径</h3><p class="mono muted path-cell">${escapeHtml(detail.path)}</p></section>
+      <section class="drawer-section"><h3>变量 (${variables.length})</h3>${variables.length ? `<div class="table-wrap"><table class="data-table"><thead><tr><th>名称</th><th>维度</th><th>Shape</th><th>Chunk</th><th>Dtype</th></tr></thead><tbody>${variables.map((variable) => `<tr><td><button class="zarr-variable-button mono path-cell" data-zarr-variable="${escapeHtml(variable.name)}">${escapeHtml(variable.name)}</button></td><td>${escapeHtml((variable.dimensions || []).join(", ") || "—")}</td><td class="mono">${escapeHtml(JSON.stringify(variable.shape || []))}</td><td class="mono">${escapeHtml(JSON.stringify(variable.chunks || []))}</td><td class="mono">${escapeHtml(variable.dtype || "—")}</td></tr>`).join("")}</tbody></table></div>` : emptyInline("该 Store 尚未写入 consolidated Zarr 元数据。")}</section>
+      <section class="drawer-section"><h3>轻量切片预览</h3><div id="zarrSlicePreview">${emptyInline("点击变量名称读取最多 2,500 个值；结果会复用服务器缓存。")}</div></section>
+      <section class="drawer-section"><h3>Store 属性</h3><pre class="json-view">${escapeHtml(JSON.stringify(detail.attributes || {}, null, 2))}</pre></section>`);
+    document.querySelectorAll("[data-zarr-variable]").forEach((button) => button.addEventListener("click", () => {
+      void loadZarrSlice(path, button.dataset.zarrVariable);
+    }));
+  } catch (error) { toast(`Zarr 详情读取失败：${error.message}`, "error"); }
+}
+
+async function loadEntityPage(path, offset, query) {
+  const target = document.querySelector("#entityPage");
+  if (!target) return;
+  target.innerHTML = '<div class="page-loading" style="min-height:120px"><span class="loader"></span></div>';
+  try {
+    const page = await api(`/lake/entities/page?path=${encodeURIComponent(path)}&offset=${offset}&limit=25&q=${encodeURIComponent(query || "")}`);
+    const columns = page.columns.slice(0, 8);
+    target.innerHTML = `${page.items.length ? `<div class="table-wrap"><table class="data-table"><thead><tr>${columns.map((column) => `<th>${escapeHtml(column)}</th>`).join("")}</tr></thead><tbody>${page.items.map((row) => `<tr>${columns.map((column) => `<td class="truncate" title="${escapeHtml(row[column] == null ? "" : typeof row[column] === "object" ? JSON.stringify(row[column]) : row[column])}">${escapeHtml(row[column] == null ? "—" : typeof row[column] === "object" ? JSON.stringify(row[column]) : row[column])}</td>`).join("")}</tr>`).join("")}</tbody></table></div>` : emptyInline("没有匹配记录")}<div class="entity-pager"><button class="table-detail-button" id="entityPrevious" ${offset <= 0 ? "disabled" : ""}>上一页</button><span class="mono">${page.total ? `${offset + 1}-${offset + page.items.length} / ${page.total}` : "0 records"}</span><button class="table-detail-button" id="entityNext" ${page.next_offset == null ? "disabled" : ""}>下一页</button></div>`;
+    document.querySelector("#entityPrevious").addEventListener("click", () => loadEntityPage(path, Math.max(0, offset - 25), query));
+    document.querySelector("#entityNext").addEventListener("click", () => loadEntityPage(path, page.next_offset, query));
+    document.querySelector("#entitySearch").onclick = () => loadEntityPage(path, 0, document.querySelector("#entityQuery").value.trim());
+    document.querySelector("#entityQuery").onkeydown = (event) => { if (event.key === "Enter") loadEntityPage(path, 0, event.currentTarget.value.trim()); };
+  } catch (error) { target.innerHTML = emptyInline(`记录读取失败：${escapeHtml(error.message)}`); }
+}
+
+async function loadEntityMap(path) {
+  const target = document.querySelector("#entityMiniMap");
+  if (!target || !window.maplibregl) return;
+  try {
+    const collection = await api(`/lake/entities/features?path=${encodeURIComponent(path)}&limit=200`);
+    if (!collection.features.length) { target.innerHTML = emptyInline("该 GeoParquet 没有可显示的几何要素"); return; }
+    if (state.entityMap) state.entityMap.remove();
+    target.innerHTML = "";
+    const map = new window.maplibregl.Map({container: target, style: mapStyle(), center: [0, 0], zoom: 1});
+    state.entityMap = map;
+    map.on("load", () => {
+      map.addSource("entity-features", {type: "geojson", data: collection});
+      map.addLayer({id: "entity-fill", type: "fill", source: "entity-features", filter: ["==", ["geometry-type"], "Polygon"], paint: {"fill-color": "#167d64", "fill-opacity": .28}});
+      map.addLayer({id: "entity-lines", type: "line", source: "entity-features", paint: {"line-color": "#0d5c4a", "line-width": 2}});
+      map.addLayer({id: "entity-points", type: "circle", source: "entity-features", filter: ["==", ["geometry-type"], "Point"], paint: {"circle-color": "#167d64", "circle-radius": 5, "circle-stroke-color": "#fff", "circle-stroke-width": 1}});
+      const bounds = collection.features.map((feature) => geometryBounds(feature.geometry)).filter(Boolean);
+      if (bounds.length) map.fitBounds(bounds.reduce((all, value) => [[Math.min(all[0][0], value[0][0]), Math.min(all[0][1], value[0][1])], [Math.max(all[1][0], value[1][0]), Math.max(all[1][1], value[1][1])]]), {padding: 24, maxZoom: 10, duration: 0});
+    });
+  } catch (error) { target.innerHTML = emptyInline(`空间要素读取失败：${escapeHtml(error.message)}`); }
+}
+
+async function loadZarrSlice(path, variable) {
+  const target = document.querySelector("#zarrSlicePreview");
+  if (!target) return;
+  target.innerHTML = '<div class="page-loading" style="min-height:140px"><span class="loader"></span></div>';
+  try {
+    const slice = await api(`/lake/arrays/slice?path=${encodeURIComponent(path)}&variable=${encodeURIComponent(variable)}&max_cells=2500`);
+    target.innerHTML = `<dl class="schema-grid">${definition("Variable", slice.variable)}${definition("Dtype", slice.dtype)}${definition("Full shape", JSON.stringify(slice.shape))}${definition("Preview", JSON.stringify(slice.preview_shape))}${definition("Min / max", slice.numeric ? `${slice.stats.min ?? "—"} / ${slice.stats.max ?? "—"}` : "非数值")}${definition("Mean / missing", slice.numeric ? `${slice.stats.mean ?? "—"} / ${slice.stats.missing}` : "—")}${definition("Cache", slice.cached ? "hit" : "miss")}</dl><div class="zarr-heatmap" id="zarrHeatmap"></div><pre class="json-view zarr-values">${escapeHtml(JSON.stringify(slice.values, null, 2))}</pre>`;
+    if (slice.numeric) renderZarrHeatmap(slice);
+  } catch (error) { target.innerHTML = emptyInline(`切片读取失败：${escapeHtml(error.message)}`); }
+}
+
+function renderZarrHeatmap(slice) {
+  const target = document.querySelector("#zarrHeatmap");
+  if (!target) return;
+  const rows = Array.isArray(slice.values)
+    ? (Array.isArray(slice.values[0]) ? slice.values : [slice.values])
+    : [[slice.values]];
+  const flat = rows.flat().filter((value) => typeof value === "number");
+  if (!flat.length) { target.remove(); return; }
+  const min = Math.min(...flat); const max = Math.max(...flat); const range = max - min || 1;
+  target.style.gridTemplateColumns = `repeat(${Math.max(...rows.map((row) => row.length))}, minmax(3px, 1fr))`;
+  target.innerHTML = rows.flatMap((row) => row.map((value) => {
+    const ratio = typeof value === "number" ? (value - min) / range : 0;
+    return `<span title="${escapeHtml(value)}" style="background:hsl(${165 - ratio * 145} 58% ${82 - ratio * 45}%)"></span>`;
+  })).join("");
+}
+
 async function openProduct(productId) {
   let product = state.products.find((item) => item.product_id === productId);
   if (!product) return;
@@ -646,12 +926,25 @@ async function openProduct(productId) {
 }
 
 const definition = (name, value) => `<div class="definition"><dt>${name}</dt><dd>${escapeHtml(value ?? "—")}</dd></div>`;
-function closeDrawer() { document.querySelector("#drawerBackdrop").classList.add("hidden"); document.querySelector("#detailDrawer").classList.add("hidden"); }
+function closeDrawer() {
+  if (state.entityMap) { state.entityMap.remove(); state.entityMap = null; }
+  document.querySelector("#drawerBackdrop").classList.add("hidden");
+  document.querySelector("#detailDrawer").classList.add("hidden");
+}
 
 function bindAssetRows() {
   document.querySelectorAll("tr[data-id], path[data-id]").forEach((row) => row.addEventListener("click", () => openAsset(row.dataset.id)));
   document.querySelectorAll(".product-card").forEach((card) => card.addEventListener("click", () => {
     void openProduct(card.dataset.product);
+  }));
+}
+
+function bindEntityRows() {
+  document.querySelectorAll("[data-entity-path]").forEach((button) => button.addEventListener("click", () => {
+    void openEntityDetail(button.dataset.entityPath);
+  }));
+  document.querySelectorAll("[data-array-path]").forEach((button) => button.addEventListener("click", () => {
+    void openArrayDetail(button.dataset.arrayPath);
   }));
 }
 
@@ -665,6 +958,10 @@ async function render() {
     state.exploreMap.remove();
     state.exploreMap = null;
   }
+  if (state.entityMap) {
+    state.entityMap.remove();
+    state.entityMap = null;
+  }
   navItems.forEach((item) => item.classList.toggle("active", item.dataset.route === state.route));
   try {
     if (state.route === "overview") renderOverview();
@@ -672,6 +969,8 @@ async function render() {
     else if (state.route === "explore") await renderExplore();
     else if (state.route === "entities") await renderEntities();
     else if (state.route === "downloads") renderDownloads();
+    else if (state.route === "materializations") await renderMaterializations();
+    else if (state.route === "health") await renderHealth();
     else if (state.route === "system") await renderSystem();
     else { state.route = "overview"; renderOverview(); }
     bindRouteTargets();
@@ -687,9 +986,9 @@ function navigate(route) {
 
 async function refreshTasks() {
   try {
-    const previousActive = state.tasks.some((task) => !["completed", "partial", "failed"].includes(task.status));
+    const previousActive = state.tasks.some(isTaskActive);
     const tasks = await api("/stac/tasks");
-    const active = tasks.some((task) => !["completed", "partial", "failed"].includes(task.status));
+    const active = tasks.some(isTaskActive);
     state.tasks = tasks;
     state.pollTick += 1;
     if (state.pollTick % 6 === 0 || (previousActive && !active)) {
@@ -702,9 +1001,23 @@ async function refreshTasks() {
   } catch (_) { /* health state is handled by explicit refresh */ }
 }
 
+let taskRefreshInFlight = false;
+async function pollTasks() {
+  if (document.hidden || taskRefreshInFlight) return;
+  taskRefreshInFlight = true;
+  try { await refreshTasks(); }
+  finally { taskRefreshInFlight = false; }
+}
+
+async function pollMaterializations() {
+  if (document.hidden || state.route !== "materializations") return;
+  try { await renderMaterializations(); }
+  catch (_) { /* explicit actions surface errors */ }
+}
+
 function updateTransferDock() {
   const dock = document.querySelector("#transferDock");
-  const active = state.tasks.find((task) => !["completed", "partial", "failed"].includes(task.status));
+  const active = state.tasks.find(isTaskActive);
   dock.classList.toggle("hidden", !active);
   if (!active) return;
   document.querySelector("#dockTitle").textContent = `${active.status} · ${shortId(active.task_id)}`;
@@ -733,7 +1046,13 @@ document.addEventListener("keydown", (event) => {
 });
 
 (async function boot() {
-  try { await loadBaseData(); await render(); setInterval(refreshTasks, 2500); }
+  try {
+    await loadBaseData();
+    await render();
+    setInterval(pollTasks, 10_000);
+    setInterval(pollMaterializations, 5_000);
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) void pollTasks(); });
+  }
   catch (error) {
     document.querySelector("#apiPulse").className = "pulse error";
     document.querySelector("#apiState").textContent = "API 连接失败";
